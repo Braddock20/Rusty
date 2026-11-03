@@ -157,6 +157,32 @@ The Rust service remains experimental. It still has no collection lease of its o
 it must not be run against the same database as the Worker; the Worker remains the
 production collector.
 
+### 11. The migration set could not be applied twice
+Migration 0001 defined `latest_score` with six columns and used `CREATE OR REPLACE VIEW`.
+Migration 0002 redefined the same view with seven (it added `id`). PostgreSQL cannot drop
+columns through `CREATE OR REPLACE VIEW`, so applying 0001 after 0002 failed with
+`cannot drop columns from view`. Any environment that re-applied the migration set — for
+example the Rust service, which migrates on every start — would fail to boot the second
+time.
+
+**Fix:** migration 0001 now drops and recreates the views and declares the same columns
+as 0002, so the full set is idempotent in any order. Verified by applying 0001–0006
+three times in a row with no error and an unchanged view definition.
+
+## Test-harness fidelity notes
+
+These are not product defects, but they are recorded because they change what the tests
+actually prove.
+
+- The Neon driver parses timestamp columns with the **PostgreSQL wire format**
+  (`2026-11-03 20:44:04.540000+00`). The shim originally emitted ISO-8601, which the
+  driver silently resolved to `null` — every timestamp in the API came back empty while
+  the database was correct. The shim now emits the PostgreSQL format, matching what a
+  real Neon server sends.
+- The integration suite reads the database through `pg` directly, so it did not exercise
+  the driver's type conversion. The HTTP smoke test does, and it is what caught the
+  timestamp problem above.
+
 ## Behaviour deliberately left unchanged
 
 - **eAdriatic completion is still not inferred from scores.** The live match hub reports
@@ -187,6 +213,28 @@ production collector.
 | Live upstream calls | eAdriatic, GT and Betika responses verified against the real payloads |
 | `cargo test` (rust-engine) | 5 passed, 0 failed; `cargo build` clean (2 dead-code warnings for the unused `EngineError` enum) |
 | Rust service boot smoke test | boots against PostgreSQL, applies all 18 relations, serves `/health`, `/health/db` and `/api/v1/fixtures`, rejects an unauthorized `POST /internal/collect` with 401 |
+| Migrations 0001–0006 applied three times consecutively | no errors, view definitions stable |
+| `scripts/test-local.sh` (mock providers) | 37 tests + 20/20 smoke checks pass |
+| `scripts/test-local.sh --live` (real upstream APIs) | 37 tests + 20/20 smoke checks pass |
+
+### Live collection result
+
+A full collection against the **real** upstream APIs, writing to a local PostgreSQL
+database, produced:
+
+| source | fixtures | completed | with team ids | usable kickoff |
+| --- | --- | --- | --- | --- |
+| gt | 1000 | 1000 | 1000 | ISO, already usable |
+| eadriatic | 212 | 0 | 212 | 212 epoch timestamps |
+| betika | 22 | 0 | 0 | 0 (timezone-less, correctly rejected) |
+
+Plus 86 standings rows, 2000 player-participation rows, 66 odds observations and 3
+pagination checkpoints.
+
+Before the fixes the same run produced **zero** GT fixtures (the sport filter rejected
+every one), zero eAdriatic team ids, zero usable eAdriatic kickoffs and zero standings
+rows. The 212 eAdriatic fixtures remain `scheduled`/`unknown` rather than completed,
+because that provider publishes no terminal status — see below.
 
 The integration suite asserts the fixed behaviour directly: the run reaches a terminal
 state, the lease is released and linked, all three providers are recorded in
@@ -197,3 +245,14 @@ score does not crash the prediction endpoints.
 The rewritten lease was additionally verified under concurrency: three simultaneous
 collections produce exactly one run, no run is left in `running`, and a lease held by
 another owner blocks a second collection without being overwritten.
+
+### Test tooling added
+
+| File | Purpose |
+| --- | --- |
+| `cloudflare/test/helpers/neon-shim.ts` | Neon HTTP `/sql` protocol on top of PostgreSQL, so the unmodified Worker runs in tests without a Neon account |
+| `cloudflare/test/helpers/provider-fixtures.ts` | Deterministic upstream payloads that mirror the real API shapes |
+| `cloudflare/test/worker.integration.test.ts` | 18 integration tests driving the real Worker over the real database |
+| `cloudflare/test/smoke.ts` | HTTP smoke test for any deployed instance; `--trigger` runs a real collection and verifies the outcome |
+| `scripts/local-server.ts` | Boots the Worker locally against a plain PostgreSQL database |
+| `scripts/test-local.sh` | One command: provision database, migrate, test, boot, smoke test |
