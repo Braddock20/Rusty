@@ -55,3 +55,10 @@ test("ambiguous local timestamps are rejected rather than guessed", () => {
   assert.equal(parseTimestamp("20261103 19:00"), null);
   assert.equal(parseTimestamp("2026-11-03T19:00:00"), null);
 });
+
+test("canonical timestamps accept Date objects and numeric epoch milliseconds", () => {
+  const expected = Date.parse("2026-11-20T20:00:00.000Z");
+  assert.equal(parseTimestamp(new Date(expected)), expected);
+  assert.equal(parseTimestamp(expected), expected);
+  assert.equal(parseTimestamp("1795204800000"), 1795204800000);
+});
