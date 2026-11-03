@@ -76,10 +76,17 @@ CREATE TABLE IF NOT EXISTS source_health (
   last_error TEXT,
   consecutive_failures INTEGER NOT NULL DEFAULT 0
 );
-CREATE OR REPLACE VIEW latest_score AS
-SELECT DISTINCT ON (source,external_id) source,external_id,observed_at,status_raw,home_score_raw,away_score_raw
-FROM score_observations ORDER BY source,external_id,observed_at DESC;
-CREATE OR REPLACE VIEW latest_odds AS
+-- The views are dropped and recreated rather than replaced in place, and they carry the
+-- same columns as the versions introduced by 0002. CREATE OR REPLACE VIEW cannot drop
+-- columns, so the original definition made this migration fail with
+-- "cannot drop columns from view" whenever it was applied after 0002 (for example when
+-- the full set is re-applied on every service start).
+DROP VIEW IF EXISTS latest_score;
+CREATE VIEW latest_score AS
+SELECT DISTINCT ON (source,external_id) source,external_id,observed_at,status_raw,home_score_raw,away_score_raw,id
+FROM score_observations ORDER BY source,external_id,observed_at DESC,id DESC;
+DROP VIEW IF EXISTS latest_odds;
+CREATE VIEW latest_odds AS
 SELECT DISTINCT ON (source,external_fixture_id,market,selection)
- source,external_fixture_id,market,selection,observed_at,odds_raw
-FROM odds_observations ORDER BY source,external_fixture_id,market,selection,observed_at DESC;
+ source,external_fixture_id,market,selection,observed_at,odds_raw,id
+FROM odds_observations ORDER BY source,external_fixture_id,market,selection,observed_at DESC,id DESC;
