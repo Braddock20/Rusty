@@ -5,8 +5,7 @@ mod db;
 mod error;
 mod normalize;
 
-use axum::{extract::{Query, State}, http::{HeaderMap, StatusCode}, routing::{get, post}, Json, Router};
-use serde::Deserialize;
+use axum::{extract::State, http::{HeaderMap, StatusCode}, routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -84,14 +83,12 @@ async fn collect(State(s): State<AppState>, headers: HeaderMap) -> (StatusCode, 
     if let Err(e) = db::finish_run(&s.pool, run_id, status, &outcomes).await {
         error!("failed to finalize run: {e}");
     }
+    // With no collector enabled there is nothing to report as a successful run.
+    if outcomes.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ok":false,"run_id":run_id,"error":"NO_SOURCES_CONFIGURED","sources":outcomes})));
+    }
     let code = if failures == outcomes.len() { StatusCode::BAD_GATEWAY } else { StatusCode::OK };
     (code, Json(json!({"ok":failures==0,"run_id":run_id,"status":status,"sources":outcomes})))
-}
-
-#[derive(Deserialize)]
-pub struct FixtureQuery {
-    source: Option<String>,
-    limit: Option<i64>,
 }
 
 
