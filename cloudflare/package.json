@@ -5,13 +5,17 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:integration": "node --experimental-strip-types --test test/worker.integration.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250124.0",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1",
     "typescript": "^5.7.3",
     "wrangler": "^3.100.0"
   },
