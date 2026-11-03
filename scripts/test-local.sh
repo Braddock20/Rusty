@@ -5,7 +5,7 @@
 #   scripts/test-local.sh [--live] [--db=postgres://user:pass@host:port/db]
 #
 # What it does:
-#   1. creates the test database (if it does not exist) and applies migrations 0001-0006
+#   1. creates the test database (if it does not exist) and applies migrations 0001-0007
 #   2. runs the unit + integration test suite against it
 #   3. boots the Worker locally on top of that database
 #   4. runs the HTTP smoke test against the running Worker
@@ -47,7 +47,7 @@ if command -v "$PSQL" >/dev/null 2>&1; then
     "$PSQL" "$DB_URL" -v ON_ERROR_STOP=1 -q -f "$migration" >/dev/null 2>&1 \
       || { echo "!! migration failed: $(basename "$migration")"; exit 1; }
   done
-  echo "==> migrations 0001-0006 applied"
+  echo "==> migrations 0001-0007 applied"
 else
   echo "==> psql not found, skipping database provisioning"
 fi
