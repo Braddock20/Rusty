@@ -135,3 +135,43 @@ npx wrangler deploy
 cargo test
 cargo run
 ```
+
+
+## Cloudflare-native scheduled collection (migration 0002)
+
+The existing `rusty` Worker now has a `scheduled()` handler and performs collection
+directly using the existing `DATABASE_URL` secret. It does not require a second Worker,
+a second database, or an Axum service for the cron path.
+
+Before deploying this revision, apply the additive migration:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0002_worker_collection.sql
+```
+
+Then from `cloudflare/`:
+
+```bash
+npm install
+npm test
+npx tsc --noEmit
+npx wrangler deploy
+```
+
+The existing `*/5 * * * *` trigger is retained. Set `ADMIN_TOKEN` only if you want
+the authenticated manual endpoint `/api/v1/collection/run`; use
+`npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
+
+The Worker polls the known eAdriatic season, the GT active-season and fixture APIs,
+and Betika's current matches feed. GT stops on access restrictions and does not
+attempt to bypass them. eAdriatic standings and Betika odds are stored as observations.
+The lock is a database lease; it prevents ordinary overlapping cron invocations.
+
+**Known scope limitations:** eAdriatic historical season discovery is not yet automatic;
+the known season is collected and additional verified season IDs can be registered
+as `entity_mappings` with `entity_type='eal_season'`. GT sport filtering depends on
+the upstream response exposing a soccer label. GT standings/player-form/head-to-head
+and detailed fixture APIs have not yet been wired. The player and head-to-head API
+routes explicitly avoid pretending that fixture participant names are verified player
+identities. Betika history is only available from the snapshots collected after deployment;
+the current matches endpoint is not treated as a historical-results API.
