@@ -1,13 +1,15 @@
 {
   "name": "esports-edge-api",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test test/guards.test.ts test/normalize.test.ts",
     "test:integration": "node --experimental-strip-types --test test/worker.integration.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --experimental-strip-types --test test/guards.test.ts test/normalize.test.ts",
+    "test:all": "node --experimental-strip-types --test test/*.test.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2"
