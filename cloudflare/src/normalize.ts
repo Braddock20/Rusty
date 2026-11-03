@@ -15,7 +15,8 @@ export function gtParticipants(fixture:JsonObject) {
   const home=ps.find((p:any)=>String(p?.side).toLowerCase()==="home");
   const away=ps.find((p:any)=>String(p?.side).toLowerCase()==="away");
   const name=(p:any)=>asText(p?.participant?.player?.nickname ?? p?.participant?.team?.name);
-  return {home:name(home),away:name(away)};
+  const teamId=(p:any)=>asText(p?.participant?.team?.id ?? p?.participant?.team?.team_id ?? p?.participant?.team?.teamId);
+  return {home:name(home),away:name(away),homeTeamId:teamId(home),awayTeamId:teamId(away)};
 }
 export function betikaSelections(fixture:JsonObject) {
   return asArray(fixture.odds).flatMap((market:any)=>asArray(market?.odds).map((selection:any)=>({
