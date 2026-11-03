@@ -1,93 +1,68 @@
-# Esports Data Engine — Hybrid Rust + Cloudflare + Neon
+# Rusty eSoccer Intelligence Engine — Cloudflare Worker + Neon
 
-A deployable starting implementation for collecting official eAdriatic (LeagueRepublic),
-GT Sports League and Betika eSoccer data into Neon PostgreSQL, preserving timestamped
-observations for later analysis and backtesting.
+Rusty collects real eSoccer data from eAdriatic/LeagueRepublic, GT Sports League and Betika into Neon PostgreSQL. The currently active production path is the **Cloudflare Worker native collector** in `cloudflare/`, with Neon as the canonical store. The Rust service in `rust-engine/` is retained as an optional legacy/experimental service; do not run its collector in parallel with the Worker until it has separately passed the same reliability and data-integrity checks.
 
-## Architecture
+## Production architecture
 
-- **Rust engine** (`rust-engine/`): long-running collector/API service. Owns HTTP clients,
-  source-specific pagination, normalization, validation, and PostgreSQL persistence.
-- **Cloudflare Worker** (`cloudflare/`): public read API + Cron Trigger. Calls the Rust
-  engine's authenticated `/internal/collect` endpoint. It does not duplicate scraping.
-- **Neon PostgreSQL**: canonical persistent store. Raw JSON snapshots are retained alongside
-  normalized fixtures, score observations, odds observations, and source identity mappings.
-- **Analysis**: SQL views and baseline feature queries are included. Predictive models should
-  only be trained after sufficient verified historical observations have accumulated.
+- **Cloudflare Worker** (`cloudflare/`): public read API and five-minute Cron Trigger; owns the active collection path and odds-free shadow prediction API.
+- **Neon PostgreSQL**: canonical persistent store. Raw snapshots, normalized fixtures, score observations, odds observations, provider health, run ownership, pagination checkpoints and forecast audit history are retained.
+- **Rust service** (`rust-engine/`): legacy/experimental implementation. It is not the deployed Worker code and is not covered by the Worker validation results in this release.
 
-## Important truth about completeness
+## Reliability policy and limits
 
-This repository contains the full application structure and runnable collection pipeline,
-but no one can honestly guarantee every undocumented upstream endpoint/schema from a pasted
-catalog alone. The source adapters are deliberately defensive and retain raw payloads. Before
-using the data for betting decisions, run `verify` and inspect `source_health`; verify GT
-HTTP 200 responses and real response bodies from your own deployment. No endpoint is bypassed
-or accessed using private credentials.
+No software can guarantee that third-party APIs, Cloudflare or a database will never fail. Rusty is designed to fail safely: it validates upstream responses, respects provider restrictions and rate limits, records source-level failures, uses an atomic database lease with heartbeats, bounds each scheduled run, resumes paginated collection, and refuses to treat ambiguous scores as completed results.
 
-The upstream API catalog supplied in the project notes is treated as a configuration baseline.
-Endpoint availability, IDs, response shapes, league-to-bookmaker player mappings and Betika
-historical results remain things to validate against live responses.
+- HTTP 401/403/451 are not retried or bypassed. GT HTTP 451 remains an access restriction.
+- HTTP 429 is not retried immediately. `Retry-After` is persisted as a source cooldown.
+- Empty or malformed JSON is reported with a stable provider-specific error; malformed responses receive one bounded retry.
+- Only transient network/408/425/5xx failures receive one bounded retry.
+- Pagination resumes from durable checkpoints. It does not silently claim that a capped page batch is the complete provider history.
+- A match is a result only when the provider status is explicitly recognized as terminal and scores are valid. Approval flags or scores alone are insufficient.
+- Team identity is source-scoped and requires explicit upstream team IDs. Names are labels, not identity keys.
+- Forecasts remain shadow-only until chronological walk-forward validation and calibration pass. Bookmaker odds are not model inputs.
+
+The existing 212 recovered eAdriatic fixtures are preserved. Migration 0006 gives existing fixtures `result_state='unknown'` rather than guessing that their scores mean they are completed. They remain available from `/api/v1/fixtures`; they are excluded from `/api/v1/results` and predictive history until a provider explicitly confirms completion.
 
 ## Requirements
 
-- Rust stable (1.80+ recommended)
+- Node.js 22.6+ and npm
 - PostgreSQL / Neon connection string
-- Cloudflare account for Worker deployment
-- A publicly reachable HTTPS deployment for the Rust engine (VPS/container host)
-- `wrangler` for Worker deployment
+- Cloudflare account and Wrangler for Worker deployment
+- Rust stable is needed only if separately developing the optional legacy Rust service
 
-## Run locally
-
-```bash
-cd rust-engine
-cp .env.example .env
-# Edit DATABASE_URL and INTERNAL_TOKEN. Never commit .env.
-cargo run
-```
-
-Health:
-```bash
-curl http://localhost:8080/health
-curl http://localhost:8080/health/db
-```
-
-Run one collection cycle:
-```bash
-curl -X POST http://localhost:8080/internal/collect \
-  -H "Authorization: Bearer $INTERNAL_TOKEN"
-```
-
-Check:
-```bash
-curl http://localhost:8080/api/v1/health
-curl http://localhost:8080/api/v1/fixtures?source=gt&limit=20
-```
-
-## Deploy Rust engine
-
-Build and run with Docker:
-
-```bash
-docker build -t esports-engine ./rust-engine
-docker run --env-file ./rust-engine/.env -p 8080:8080 esports-engine
-```
-
-Set `PORT`, `DATABASE_URL`, `INTERNAL_TOKEN`, source base URLs and optional IDs in the host's
-secret/environment settings. Put the service behind HTTPS. Restrict `/internal/*` with the
-token; do not expose the token to browsers.
-
-## Deploy Cloudflare Worker
+## Run and test the production Worker locally
 
 ```bash
 cd cloudflare
 npm install
-npx wrangler secret put ENGINE_URL
-npx wrangler secret put ENGINE_TOKEN
+npm test
+npx wrangler dev
+```
+
+Configure the `DATABASE_URL` secret/binding in the local Wrangler environment. Do not commit credentials or `.dev.vars` files.
+
+The optional Rust service is not the active production collector. Its collectors and API are not covered by this Worker hardening release; do not run it as a second writer against the production Neon database.
+
+## Deploy Cloudflare Worker
+
+Apply migrations 0001 through 0005 if they have not already been applied. Then apply the new additive hardening migration:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0006_production_hardening.sql
+```
+
+From `cloudflare/`:
+
+```bash
+npm install
+npm test
+npx tsc --noEmit
 npx wrangler deploy
 ```
 
-`ENGINE_URL` is the public HTTPS base URL of the Rust service. `ENGINE_TOKEN` must equal
-`INTERNAL_TOKEN` on the Rust service. Configure the Cron schedule in `wrangler.toml`.
+The existing `*/5 * * * *` Cron Trigger is retained. The Worker reads `DATABASE_URL` from its secret. Set `ADMIN_TOKEN` only if you want the authenticated manual endpoint `/api/v1/collection/run`; use `npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
+
+Do not manually trigger a collection until migration 0006 has completed and the Worker deployment has finished. A previously active lease from an older deployment may need to expire before the new collector can acquire it.
 
 ## Data model
 
@@ -102,32 +77,26 @@ npx wrangler deploy
 
 ## Operational policy
 
-- EAL: default to no more than 30 calls/minute, cache season/group metadata, exponential
-  backoff on 429, and honour `Retry-After`.
-- GT: send ordinary `Origin` and `Referer` headers for the official site; assert HTTP 200;
-  page at no more than 200 rows, increment offset by actual returned rows, stop on empty page.
-  Use a conservative delay and stop if upstream returns 401/403/451.
-- Betika: use the public matches endpoint already observed; poll at a polite interval. The
-  current adapter captures available upcoming eSoccer fixtures and 1X2 odds. It does not
-  pretend to have a verified historical results endpoint.
-- Cron is a trigger, not a guarantee of exact execution time. Rust service scheduling is
-  controlled by the host. For live score tracking, use a VPS process or frequent external
-  triggers, within source terms and rate limits.
-- Keep raw snapshots. Do not overwrite history.
-- Predictions must be evaluated out-of-sample; never use future information in features.
+- eAdriatic: keep request volume below the observed 30 calls/minute limit and honor HTTP 429 `Retry-After` cooldowns. No rate-limit bypass is attempted.
+- GT: send ordinary `Origin` and `Referer` headers; validate response shape; stop on 401/403/451 without bypass attempts. Fixture pages resume from durable offsets.
+- Betika: validate `data[]`, distinguish empty/malformed bodies, and resume page-based collection. This feed is not treated as a verified historical-results endpoint.
+- Collection runs are bounded, sequential across providers, lease-protected and heartbeat-monitored. Each provider failure is isolated and recorded.
+- Keep raw snapshots and append-only observations. Do not delete historical data as a troubleshooting shortcut.
+- Prediction history is immutable per source/fixture/model; only explicit completed scores settle forecasts. Odds are excluded from prediction features.
+- Cron is a trigger, not a guarantee of exact execution time. Always inspect run status and source health rather than assuming a scheduled trigger succeeded.
 
-## First deployment checklist
+## First production deployment checklist
 
-1. Create Neon project and run `rust-engine/migrations/0001_init.sql`.
-2. Set secrets in the Rust host.
-3. Deploy Rust service to a host with persistent network access.
-4. Confirm `/health/db`.
-5. Run one collection cycle and inspect `collection_runs`, `source_health`, `raw_snapshots`.
-6. Confirm GT responses are genuine HTTP 200, not proxy-generated error payloads.
-7. Deploy Worker and configure its secrets.
-8. Check `/api/health` on the Worker.
-9. Add entity mappings only after manually verifying participant identity.
-10. Collect history before enabling any prediction workflow.
+1. Confirm migrations 0001 through 0005 are already applied.
+2. Apply `rust-engine/migrations/0006_production_hardening.sql` to Neon.
+3. Confirm the Worker has its `DATABASE_URL` secret and the correct account/environment.
+4. Run `npm test` and `npx tsc --noEmit` from `cloudflare/`.
+5. Deploy the Worker.
+6. Verify `/api/v1/health`, `/api/v1/sources`, and `/api/v1/collection/status`.
+7. Wait for a scheduled run to complete; do not trigger a second run while a lease is active.
+8. Inspect `/api/v1/runs` and provider health; distinguish `success`, `partial`, `failed`, and skipped due to an active lease.
+9. Verify `/api/v1/results` contains only explicitly completed fixtures.
+10. Keep predictions in shadow mode until real chronological backtests and calibration pass.
 
 ## Included commands
 
@@ -137,60 +106,35 @@ cargo run
 ```
 
 
-## Cloudflare-native scheduled collection (migration 0002)
+## Cloudflare-native collection and operational checks
 
-The existing `rusty` Worker now has a `scheduled()` handler and performs collection
-directly using the existing `DATABASE_URL` secret. It does not require a second Worker,
-a second database, or an Axum service for the cron path.
+The Worker collects directly from the three configured providers. It uses a three-minute renewable lease, independent heartbeat, eight-minute run budget, per-fixture ownership checkpoints, and sequential source isolation. A scheduled invocation that cannot acquire the lease exits without starting a duplicate run. Old runs are reconciled only after their heartbeat is stale.
 
-Before deploying this revision, apply the additive migration:
+GT and Betika pagination cursors are stored in `collection_checkpoints` and resumed on later Cron runs. A full page at the configured per-run page cap is not reported as a fully completed historical crawl; the cursor advances instead. eAdriatic collection observes a conservative inter-season delay and honors HTTP 429 cooldowns. GT access restrictions are respected without bypass attempts.
 
-```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0002_worker_collection.sql
-```
-
-Then from `cloudflare/`:
-
-```bash
-npm install
-npm test
-npx tsc --noEmit
-npx wrangler deploy
-```
-
-The existing `*/5 * * * *` trigger is retained. Set `ADMIN_TOKEN` only if you want
-the authenticated manual endpoint `/api/v1/collection/run`; use
-`npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
-
-The Worker polls the known eAdriatic season, the GT active-season and fixture APIs,
-and Betika's current matches feed. GT stops on access restrictions and does not
-attempt to bypass them. eAdriatic standings and Betika odds are stored as observations.
-The lock is a database lease; it prevents ordinary overlapping cron invocations.
-
-**Known scope limitations:** eAdriatic historical season discovery is not yet automatic;
-the known season is collected and additional verified season IDs can be registered
-as `entity_mappings` with `entity_type='eal_season'`. GT sport filtering depends on
-the upstream response exposing a soccer label. GT standings/player-form/head-to-head
-and detailed fixture APIs have not yet been wired. The player and head-to-head API
-routes explicitly avoid pretending that fixture participant names are verified player
-identities. Betika history is only available from the snapshots collected after deployment;
-the current matches endpoint is not treated as a historical-results API.
+Operational endpoints:
+- `GET /api/v1/health` — Worker-to-Neon connectivity.
+- `GET /api/v1/sources` — all expected providers and latest attempt/success/error/cooldown details.
+- `GET /api/v1/collection/status` — lease owner, run heartbeat, recent runs and pagination cursors.
+- `GET /api/v1/runs?limit=25` — run history.
+- `GET /api/v1/fixtures` — all normalized fixtures, including ambiguous historical rows.
+- `GET /api/v1/results` — only explicitly completed fixtures with valid scores.
 
 ## Odds-free prediction engine (experimental shadow mode)
 
-Apply `rust-engine/migrations/0003_prediction_engine.sql` after migrations 0001 and 0002. The Worker exposes:
+Migrations 0003 and 0004 provide the prediction schema; migration 0006 adds the hardening and forecast-claim tables. The Worker exposes:
 
 - `GET /api/v1/predictions?limit=30` — upcoming fixtures with experimental, odds-free model forecasts; optionally filter with `&source=betika`, `eadriatic`, or `gt`.
 - `GET /api/v1/predict` — alias for the same endpoint.
 - `GET /api/v1/predictions/performance` — settled walk-forward forecast record (accuracy and multiclass Brier score).
 
-The first experimental ensemble combines a recency-weighted Elo rating with a score-distribution model using historical goals for/against and shrinkage toward competition averages. It reads fixture results only; it never queries or uses `odds_observations`. A forecast is withheld when the exact source/competition history has fewer than 12 matches for the two participants. The current version is deliberately marked `SHADOW_ONLY_UNVALIDATED` or `PASS_*`; do not use it as a betting recommendation. Its probability outputs are model estimates, not accuracy percentages. `evidence_strength_score` measures sample support, not chance of winning.
+The experimental `rusty-shadow-v2` ensemble combines a recency-weighted Elo rating with a score-distribution model using completed historical goals for/against and shrinkage toward source/competition averages. It reads fixtures marked `result_state=completed` only; it never queries or uses `odds_observations`. The first pre-match forecast per fixture/model is immutable and protected against concurrent duplicate insertion. A forecast is withheld unless at least 12 completed, source-scoped matches per participant can be linked using explicit team IDs and a verified competition ID. Team names alone are never identity keys. Ambiguous local-time kickoff strings are rejected rather than guessed. The current version is deliberately marked `SHADOW_ONLY_UNVALIDATED` or `PASS_*`; do not use it as a betting recommendation. Its probability outputs are model estimates, not accuracy percentages. `evidence_strength_score` measures sample support, not chance of winning.
 
-Before promoting a model to actionable status, build and pass chronological walk-forward tests on the actual eAdriatic and GT datasets, compare against simple baselines, report accuracy plus log loss/Brier score and calibration by probability bucket, and retain a truly untouched final test period. The present production sources do not yet provide reliable eAdriatic/GT histories (eAdriatic previously returned a schema error; GT returned HTTP 451), so this patch must not claim a validated 99.999% success rate. Betika may supply fixture names/scores for its competitions, but its odds are excluded from every prediction feature.
+Before promoting a model to actionable status, build and pass chronological walk-forward tests on the actual eAdriatic and GT datasets, compare against simple baselines, report accuracy plus log loss/Brier score and calibration by probability bucket, and retain a truly untouched final test period. The currently recovered eAdriatic records do not have verified completed status, and GT previously returned HTTP 451. Those limitations mean this patch cannot claim a validated accuracy rate. Betika may supply fixture names/scores for its competitions, but its odds are excluded from every prediction feature.
 
 ## Rusty intelligence foundation (migration 0004)
 
-Apply `rust-engine/migrations/0004_intelligence_foundation.sql` after migrations 0001-0003. It is additive and preserves existing production rows. It creates source-scoped player/team participation history, player-team relationship history, model registry, backtest records, and prediction feature snapshots.
+Migration 0004 creates the intelligence foundation and is a prerequisite for the current Worker player and model-registry endpoints. It is additive and preserves existing production rows. It creates source-scoped player/team participation history, player-team relationship history, model registry, backtest records, and prediction feature snapshots.
 
 New endpoints:
 - `GET /api/v1/intelligence/status` — data coverage and model registry status.
@@ -200,6 +144,14 @@ New endpoints:
 GT collection now records player/team relationships only when the upstream fixture explicitly provides player IDs and team IDs. Starter status and position are nullable and remain unknown unless the source explicitly supplies them. Names are never used to merge identities across sources. The prediction response now includes last-ten form, head-to-head summary, and player/team pairing evidence where verified IDs and history exist. These player/team observations are currently explanatory evidence, not a model weight; they must pass independent walk-forward ablation tests before they influence forecast probabilities.
 
 Predictions remain odds-free and shadow-only. `probabilities` are model estimates, not accuracy percentages. `evidence_strength_score` is not a probability. The system must not promote a model based on hit rate alone: promotion requires adequate sample size, improvement over simple baselines on chronological holdouts, acceptable Brier score/log loss, calibration checks, and stable performance across source/competition/time segments. No 99.999% accuracy is promised.
+
+### Production hardening release
+
+Migration `0006_production_hardening.sql` is additive. It adds run ownership/heartbeat fields, source attempt diagnostics, explicit result state, explicit home/away team IDs, durable pagination checkpoints, and a unique forecast-claim table. It does not delete or rewrite the 212 recovered eAdriatic records or existing forecast history. Existing fixture result states default to `unknown` by design.
+
+The Worker test suite includes provider-status classification, malformed/empty JSON handling, retry policy, safe query bounds, timestamp ambiguity rejection, and normalization tests. A TypeScript syntax/type pass can be run with the project's installed dependencies; live Neon/Cloudflare integration and live provider calls must still be verified after deployment.
+
+The Rust service remains experimental and is not covered by this Worker patch. Do not deploy both Rust and Worker collectors against the same Neon database as parallel scheduled writers.
 
 ### Required next data capabilities
 
