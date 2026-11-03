@@ -22,17 +22,28 @@ pub async fn collect(s: &AppState, run_id: i64) -> Outcome {
         if let Err(e)=db::save_raw(&s.pool,run_id,"gt","fixtures_page",Some(&offset.to_string()),&v).await { errors.push(e.to_string());break; }
         let n=rows.len();
         for row in rows {
+            // GT carries football and basketball in one feed; only eSoccer is collected.
+            if !normalize::gt_is_soccer(row) { continue; }
             let id=normalize::fixture_id(row,&["id","fixtureId","fixture_id","_id"]).unwrap_or_else(||format!("offset-{offset}-row-{total}"));
-            let hs=normalize::text(row,&["homeScore","home_score","scoreHome"]);
-            let as_=normalize::text(row,&["awayScore","away_score","scoreAway"]);
-            let _=db::save_fixture(&s.pool,"gt",&id,
-                normalize::text(row,&["seasonName","competition","sportName"]).as_deref(),
-                normalize::text(row,&["homePlayerName","homeTeamName","home","player1"]).as_deref(),
-                normalize::text(row,&["awayPlayerName","awayTeamName","away","player2"]).as_deref(),
-                normalize::text(row,&["kickoff","date","startTime"]).as_deref(),
-                normalize::text(row,&["status","fixtureStatus"]).as_deref(),
-                hs.as_deref(),as_.as_deref(),row).await;
-            let _=db::save_score(&s.pool,"gt",&id,normalize::text(row,&["status","fixtureStatus"]).as_deref(),hs.as_deref(),as_.as_deref(),row).await;
+            let (home,home_id)=normalize::gt_side(row,"home").unwrap_or((String::new(),None));
+            let (away,away_id)=normalize::gt_side(row,"away").unwrap_or((String::new(),None));
+            let hs=normalize::gt_score(row,"home");
+            let as_=normalize::gt_score(row,"away");
+            let competition=normalize::text(row,&["seasonName","competition","sportName"]);
+            let kickoff=normalize::text(row,&["kickoff","date","startTime"]);
+            let status=normalize::text(row,&["status","fixtureStatus"]);
+            if let Err(e)=db::save_fixture(&s.pool,"gt",&id,
+                competition.as_deref(),
+                if home.is_empty(){None}else{Some(home.as_str())},
+                if away.is_empty(){None}else{Some(away.as_str())},
+                kickoff.as_deref(),status.as_deref(),hs.as_deref(),as_.as_deref(),
+                home_id.as_deref(),away_id.as_deref(),row).await {
+                    errors.push(format!("{id}: {e}"));
+                    continue;
+                }
+            if let Err(e)=db::save_score(&s.pool,"gt",&id,status.as_deref(),hs.as_deref(),as_.as_deref(),row).await {
+                    errors.push(format!("{id}: {e}"));
+                }
             total+=1;
         }
         if n<s.cfg.gt_page_size { break; }
