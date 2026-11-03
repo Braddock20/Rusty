@@ -33,9 +33,8 @@ const betikaKickoff = (value: unknown, offsetMinutes: number): string | null => 
   }
   return raw;
 };
-const RELEASE_VERSION = "0.2.1";
+const RELEASE_VERSION = "0.2.2";
 const MAX_RUN_MS = 8 * 60 * 1000;
-const HEARTBEAT_MS = 30000;
 
 async function getJson(url: string, headers: Record<string,string> = {}, source="UPSTREAM"): Promise<any> {
   let last: unknown;
@@ -328,10 +327,10 @@ async function collect(env:Env):Promise<any>{
   if(!linkRows.length) throw new Error("COLLECTION_LEASE_LINK_FAILED: lease acquired but the run could not be linked");
   const id=Number(linkRows[0].run_id);
   const started=Date.now();
-  let heartbeatStopped=false;
-  const wakeHeartbeat:{current:(()=>void)|null}={current:null};
-  let heartbeatError:unknown=null;
-  let lastRenewal=Date.now();
+  // Renew synchronously at every collector checkpoint. A background timer is
+  // not a reliable lease keeper in scheduled isolates: it can be suspended while
+  // the event is waiting on upstream/database work. Checkpoint renewal couples
+  // lease extension to actual forward progress and prevents stale heartbeats.
   const renewLock=async()=>{
     const updated=await sql`WITH owned AS (
         UPDATE collection_lock SET locked_until=now()+interval '3 minutes'
@@ -341,27 +340,10 @@ async function collect(env:Env):Promise<any>{
         FROM owned WHERE r.id=owned.run_id AND r.status='running' AND r.owner_token=${ownerToken}
         RETURNING r.id`;
     if(!updated.length) throw new Error("COLLECTION_LOCK_LOST: run no longer owns the scheduled lease");
-    lastRenewal=Date.now();
   };
-  const heartbeat=(async()=>{
-    while(!heartbeatStopped){
-      await new Promise<void>(resolve=>{
-        const timer=setTimeout(resolve,HEARTBEAT_MS);
-        wakeHeartbeat.current=()=>{clearTimeout(timer);resolve();};
-      });
-      wakeHeartbeat.current=null;
-      if(heartbeatStopped) break;
-      try { await renewLock(); } catch(e) { heartbeatError=e; break; }
-    }
-  })();
   const renew=async()=>{
     if(Date.now()-started>MAX_RUN_MS) throw new Error("COLLECTION_TIME_BUDGET_EXHAUSTED: run stopped safely before Worker execution limit");
-    if(heartbeatError) throw new Error(`COLLECTION_HEARTBEAT_FAILED: ${String(heartbeatError)}`);
-    if(Date.now()-lastRenewal>=HEARTBEAT_MS) await renewLock();
-    else {
-      const owner=await sql`SELECT run_id FROM collection_lock WHERE lock_name='scheduled' AND owner_token=${ownerToken} AND run_id=${id} AND locked_until>now()`;
-      if(!owner.length) throw new Error("COLLECTION_LOCK_LOST: ownership check failed at checkpoint");
-    }
+    await renewLock();
   };
   try {
     // Reconcile only old runs whose heartbeat is stale; never mark a recently
@@ -376,7 +358,6 @@ async function collect(env:Env):Promise<any>{
     results.push(await collectEal(sql,id,renew));
     results.push(await collectGt(sql,id,renew));
     results.push(await collectBetika(sql,id,renew,Number(env.BETIKA_UTC_OFFSET_MINUTES ?? "")));
-    if(heartbeatError) throw new Error(`COLLECTION_HEARTBEAT_FAILED: ${String(heartbeatError)}`);
     if(!results.length) throw new Error("NO_SOURCES_CONFIGURED");
     const failures=results.filter(x=>!x.ok).length;
     const status=failures===0?"success":failures===results.length?"failed":"partial";
@@ -387,9 +368,6 @@ async function collect(env:Env):Promise<any>{
     await sql`UPDATE collection_runs SET finished_at=now(),status='failed',summary=${JSON.stringify({error:message})}::jsonb,heartbeat_at=now() WHERE id=${id} AND owner_token=${ownerToken} AND status='running'`;
     throw e;
   } finally {
-    heartbeatStopped=true;
-    wakeHeartbeat.current?.();
-    await heartbeat;
     await sql`UPDATE collection_lock SET locked_until=now(),owner_token=NULL,run_id=NULL
       WHERE lock_name='scheduled' AND owner_token=${ownerToken} AND run_id=${id}`;
   }
