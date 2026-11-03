@@ -114,7 +114,7 @@ test("source health is recorded for every provider", { skip }, async () => {
 test("fixtures are collected and classified by explicit provider status", { skip }, async () => {
   await runCollection();
   const fixtures = await shim!.query(
-    `SELECT source, external_id, result_state, home_team_external_id, away_team_external_id, kickoff_raw, competition FROM fixtures ORDER BY source, external_id`,
+    `SELECT source, external_id, result_state, home_team_external_id, away_team_external_id, kickoff_raw, kickoff_at, competition FROM fixtures ORDER BY source, external_id`,
   );
   assert.ok(fixtures.rows.length >= 6, `expected fixtures from all providers, got ${fixtures.rows.length}`);
 
@@ -122,7 +122,8 @@ test("fixtures are collected and classified by explicit provider status", { skip
   assert.equal(eal!.result_state, "scheduled", "Normal / Scheduled must not be completed");
   assert.equal(eal!.home_team_external_id, "928278216", "LeagueRepublic scalar team id was not captured");
   assert.equal(eal!.away_team_external_id, "724171548", "LeagueRepublic scalar team id was not captured");
-  assert.match(eal!.kickoff_raw, /^\d{13}$/, "eAdriatic kickoff must use the unambiguous epoch milliseconds");
+  assert.match(eal!.kickoff_raw, /^\d{13}$/, "eAdriatic kickoff must preserve the unambiguous provider epoch");
+  assert.ok(eal!.kickoff_at, "eAdriatic canonical kickoff_at was not populated");
   assert.equal(eal!.competition, "FC26 SEASON 11", "LeagueRepublic fixture group description was not captured");
 
   const cancelled = fixtures.rows.find((r: any) => r.source === "eadriatic" && r.external_id === "45179999");
@@ -168,6 +169,17 @@ test("GET /api/v1/fixtures returns the full feed, not a single row", { skip }, a
   assert.equal(status, 200);
   assert.ok(body.fixtures.length > 1, `default limit returned only ${body.fixtures.length} fixture(s)`);
   assert.equal(body.limit, 50);
+});
+
+test("GET /api/v1/fixtures/upcoming only returns canonical future kickoff timestamps", { skip }, async () => {
+  await runCollection();
+  const { status, body } = await api("/api/v1/fixtures/upcoming");
+  assert.equal(status, 200);
+  assert.ok(body.fixtures.length > 0, "expected future fixtures from deterministic provider payloads");
+  for (const fixture of body.fixtures) {
+    assert.ok(fixture.kickoff_at, `fixture ${fixture.external_id} has no canonical kickoff_at`);
+    assert.ok(Date.parse(fixture.kickoff_at) > Date.now(), `fixture ${fixture.external_id} is not in the future`);
+  }
 });
 
 test("GET /api/v1/results only returns explicitly completed fixtures", { skip }, async () => {
