@@ -1,7 +1,7 @@
 import { gtParticipants, gtPlayerParticipants, isSoccerCompetition, soccerSportIds, ealStandingsTables, ealTeamId } from "./normalize.ts";
 import { neon } from "@neondatabase/serverless";
 import { buildPredictions } from "./prediction.ts";
-import { classifyResultState, parseJsonBody, isRetryableStatus, safeInt } from "./guards.ts";
+import { classifyResultState, parseJsonBody, isRetryableStatus, safeInt, parseTimestamp } from "./guards.ts";
 
 interface Env { DATABASE_URL: string; ADMIN_TOKEN?: string; BETIKA_UTC_OFFSET_MINUTES?: string; }
 type Obj = Record<string, any>;
@@ -80,10 +80,12 @@ async function raw(sql:any, runId:number, source:string, dataset:string, externa
 }
 async function upsertFixture(sql:any, runId:number, source:string, id:string, comp:any, home:any, away:any, kickoff:any, status:any, hs:any, ascore:any, payload:any, homeTeamId:any=null, awayTeamId:any=null, competitionId:any=null) {
   const resultState=classifyResultState(source,status,payload);
+  const kickoffMillis=parseTimestamp(kickoff);
+  const kickoffAt=kickoffMillis===null?null:new Date(kickoffMillis).toISOString();
   const prior = await sql`SELECT status_raw,home_score_raw,away_score_raw,result_state FROM fixtures WHERE source=${source} AND external_id=${id} LIMIT 1`;
-  await sql`INSERT INTO fixtures(source,external_id,competition,home_name,away_name,kickoff_raw,status_raw,home_score_raw,away_score_raw,payload,result_state,home_team_external_id,away_team_external_id,competition_external_id,updated_at)
-    VALUES(${source},${id},${str(comp)},${str(home)},${str(away)},${str(kickoff)},${str(status)},${str(hs)},${str(ascore)},${JSON.stringify(payload)}::jsonb,${resultState},${str(homeTeamId)},${str(awayTeamId)},${str(competitionId)},now())
-    ON CONFLICT(source,external_id) DO UPDATE SET competition=EXCLUDED.competition,home_name=EXCLUDED.home_name,away_name=EXCLUDED.away_name,kickoff_raw=EXCLUDED.kickoff_raw,status_raw=EXCLUDED.status_raw,home_score_raw=EXCLUDED.home_score_raw,away_score_raw=EXCLUDED.away_score_raw,payload=EXCLUDED.payload,result_state=CASE WHEN EXCLUDED.result_state='unknown' THEN fixtures.result_state ELSE EXCLUDED.result_state END,home_team_external_id=COALESCE(EXCLUDED.home_team_external_id,fixtures.home_team_external_id),away_team_external_id=COALESCE(EXCLUDED.away_team_external_id,fixtures.away_team_external_id),competition_external_id=COALESCE(EXCLUDED.competition_external_id,fixtures.competition_external_id),updated_at=now()`;
+  await sql`INSERT INTO fixtures(source,external_id,competition,home_name,away_name,kickoff_raw,kickoff_at,status_raw,home_score_raw,away_score_raw,payload,result_state,home_team_external_id,away_team_external_id,competition_external_id,updated_at)
+    VALUES(${source},${id},${str(comp)},${str(home)},${str(away)},${str(kickoff)},${kickoffAt},${str(status)},${str(hs)},${str(ascore)},${JSON.stringify(payload)}::jsonb,${resultState},${str(homeTeamId)},${str(awayTeamId)},${str(competitionId)},now())
+    ON CONFLICT(source,external_id) DO UPDATE SET competition=EXCLUDED.competition,home_name=EXCLUDED.home_name,away_name=EXCLUDED.away_name,kickoff_raw=EXCLUDED.kickoff_raw,kickoff_at=COALESCE(EXCLUDED.kickoff_at,fixtures.kickoff_at),status_raw=EXCLUDED.status_raw,home_score_raw=EXCLUDED.home_score_raw,away_score_raw=EXCLUDED.away_score_raw,payload=EXCLUDED.payload,result_state=CASE WHEN EXCLUDED.result_state='unknown' THEN fixtures.result_state ELSE EXCLUDED.result_state END,home_team_external_id=COALESCE(EXCLUDED.home_team_external_id,fixtures.home_team_external_id),away_team_external_id=COALESCE(EXCLUDED.away_team_external_id,fixtures.away_team_external_id),competition_external_id=COALESCE(EXCLUDED.competition_external_id,fixtures.competition_external_id),updated_at=now()`;
   const changed = !prior.length || prior[0].status_raw!==str(status) || prior[0].home_score_raw!==str(hs) || prior[0].away_score_raw!==str(ascore) || prior[0].result_state!==resultState;
   if (changed && (hs!==null || ascore!==null || status!==null)) {
     await sql`INSERT INTO score_observations(source,external_id,status_raw,home_score_raw,away_score_raw,payload,result_state)
@@ -395,13 +397,17 @@ async function route(request:Request,env:Env):Promise<Response>{
     return json({sources:rows});
   }
   if(path==="/api/v1/collection/status"){
-    const lockRows=await sql`SELECT lock_name,locked_until,owner_token,run_id,
+    const lockRows=await sql`SELECT lock_name,locked_until,(owner_token IS NOT NULL) AS has_owner_token,run_id,
       (locked_until>now()) AS is_locked,now() AS database_time
       FROM collection_lock WHERE lock_name='scheduled'`;
     const recentRuns=await sql`SELECT id,status,started_at,heartbeat_at,finished_at,summary
       FROM collection_runs ORDER BY id DESC LIMIT 5`;
     const checkpoints=await sql`SELECT source,dataset,cursor,last_complete_at,updated_at FROM collection_checkpoints ORDER BY source,dataset`;
-    return json({lock:lockRows[0]??null,recent_runs:recentRuns,checkpoints});
+    const lock=lockRows[0]??null;
+    const runningRows=await sql`SELECT count(*)::int AS count FROM collection_runs WHERE status='running'`;
+    const linkedRows=lock?.run_id==null?[]:await sql`SELECT id,status,heartbeat_at,started_at FROM collection_runs WHERE id=${lock.run_id} LIMIT 1`;
+    const linkedRun=linkedRows[0]??null;
+    return json({lock,recent_runs:recentRuns,checkpoints,diagnostics:{running_runs_count:Number(runningRows[0]?.count??0),active_lock_has_run_link:lock?.is_locked?Boolean(linkedRun):null,linked_run_status:linkedRun?.status??null,linked_run_heartbeat_at:linkedRun?.heartbeat_at??null,warning:lock?.is_locked&&lock.run_id==null?"Active lease has no linked collection run; inspect deployed Worker version and lease owner before manual collection.":null}});
   }
   if(path==="/api/v1/predictions"||path==="/api/v1/predict"){
     const predictionLimit=safeInt(url.searchParams.get("limit"),30,1,100);
@@ -436,6 +442,12 @@ async function route(request:Request,env:Env):Promise<Response>{
   const limit=safeInt(url.searchParams.get("limit"),50,1,200);
   const offset=safeInt(url.searchParams.get("offset"),0,0,1000000);
   const source=url.searchParams.get("source");
+  if(path==="/api/v1/fixtures/upcoming"){
+    const rows=source
+      ? await sql`SELECT * FROM fixtures WHERE source=${source} AND kickoff_at>now() AND result_state IN ('scheduled','unknown') ORDER BY kickoff_at ASC,id ASC LIMIT ${limit} OFFSET ${offset}`
+      : await sql`SELECT * FROM fixtures WHERE kickoff_at>now() AND result_state IN ('scheduled','unknown') ORDER BY kickoff_at ASC,id ASC LIMIT ${limit} OFFSET ${offset}`;
+    return json({count:rows.length,limit,offset,fixtures:rows,note:"Upcoming fixtures require a normalized timezone-aware kickoff_at later than database time. Ambiguous local timestamps are excluded."});
+  }
   if(path==="/api/v1/fixtures"||path==="/api/v1/results"){
     // /fixtures is the full feed. /results is deliberately stricter: a numeric score
     // alone is not enough; the provider must explicitly mark the event as completed.
@@ -445,14 +457,14 @@ async function route(request:Request,env:Env):Promise<Response>{
         ? await sql`SELECT * FROM fixtures WHERE source=${source}
             AND result_state='completed'
             AND home_score_raw ~ '^[0-9]+$' AND away_score_raw ~ '^[0-9]+$'
-            ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
-        : await sql`SELECT * FROM fixtures WHERE source=${source} ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+            ORDER BY kickoff_at DESC NULLS LAST,kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM fixtures WHERE source=${source} ORDER BY kickoff_at DESC NULLS LAST,kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
       : completedOnly
         ? await sql`SELECT * FROM fixtures
             WHERE result_state='completed'
             AND home_score_raw ~ '^[0-9]+$' AND away_score_raw ~ '^[0-9]+$'
-            ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
-        : await sql`SELECT * FROM fixtures ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`;
+            ORDER BY kickoff_at DESC NULLS LAST,kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM fixtures ORDER BY kickoff_at DESC NULLS LAST,kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`;
     return json({count:rows.length,limit,offset,fixtures:rows,
       ...(completedOnly?{note:"Only fixtures with an explicit recognized terminal provider status and valid numeric scores are returned. Ambiguous historical statuses are intentionally excluded until verified."}:{})});
   }
@@ -474,7 +486,7 @@ async function route(request:Request,env:Env):Promise<Response>{
     if(!env.ADMIN_TOKEN||request.headers.get("authorization")!==`Bearer ${env.ADMIN_TOKEN}`)return json({error:"unauthorized"},401);
     return json(await collect(env));
   }
-  if(path==="/") return json({service:"Esports Data Engine",status:"online",endpoints:["/api/v1/health","/api/v1/fixtures","/api/v1/results","/api/v1/standings","/api/v1/odds","/api/v1/odds/history","/api/v1/runs","/api/v1/sources","/api/v1/collection/status","/api/v1/predictions","/api/v1/predictions/performance","/api/v1/intelligence/status","/api/v1/players"]});
+  if(path==="/") return json({service:"Esports Data Engine",status:"online",endpoints:["/api/v1/health","/api/v1/fixtures","/api/v1/fixtures/upcoming","/api/v1/results","/api/v1/standings","/api/v1/odds","/api/v1/odds/history","/api/v1/runs","/api/v1/sources","/api/v1/collection/status","/api/v1/predictions","/api/v1/predictions/performance","/api/v1/intelligence/status","/api/v1/players"]});
   return json({error:"not_found",path},404);
 }
 export default {
