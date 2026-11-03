@@ -5,5 +5,3 @@ compatibility_date = "2026-11-03"
 [vars]
 PUBLIC_API_ENABLED = "true"
 
-[triggers]
-crons = ["*/5 * * * *"]
