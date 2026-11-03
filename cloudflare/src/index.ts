@@ -51,26 +51,42 @@ async function upsertFixture(sql:any, runId:number, source:string, id:string, co
       VALUES(${source},${id},${str(status)},${str(hs)},${str(ascore)},${JSON.stringify(payload)}::jsonb)`;
   }
 }
+function retryAfterSeconds(error:string):number|null {
+  const match=error.match(/retry after (\d+)s/i);
+  if(!match) return null;
+  const seconds=Number(match[1]);
+  return Number.isFinite(seconds)&&seconds>0?Math.min(seconds,86400):null;
+}
 async function updateHealth(sql:any, source:string, error?:string) {
-  if (error) await sql`INSERT INTO source_health(source,last_error_at,last_error,consecutive_failures) VALUES(${source},now(),${error.slice(0,2000)},1)
-    ON CONFLICT(source) DO UPDATE SET last_error_at=now(),last_error=EXCLUDED.last_error,consecutive_failures=source_health.consecutive_failures+1`;
-  else await sql`INSERT INTO source_health(source,last_success_at,last_error,consecutive_failures) VALUES(${source},now(),NULL,0)
-    ON CONFLICT(source) DO UPDATE SET last_success_at=now(),last_error=NULL,consecutive_failures=0`;
+  if (error) {
+    const cooldown=retryAfterSeconds(error);
+    await sql`INSERT INTO source_health(source,last_error_at,last_error,consecutive_failures,cooldown_until)
+      VALUES(${source},now(),${error.slice(0,2000)},1,${cooldown===null?null: new Date(Date.now()+cooldown*1000).toISOString()})
+      ON CONFLICT(source) DO UPDATE SET last_error_at=now(),last_error=EXCLUDED.last_error,
+      consecutive_failures=source_health.consecutive_failures+1,
+      cooldown_until=CASE WHEN EXCLUDED.cooldown_until IS NOT NULL THEN EXCLUDED.cooldown_until ELSE source_health.cooldown_until END`;
+  } else await sql`INSERT INTO source_health(source,last_success_at,last_error,consecutive_failures,cooldown_until) VALUES(${source},now(),NULL,0,NULL)
+    ON CONFLICT(source) DO UPDATE SET last_success_at=now(),last_error=NULL,consecutive_failures=0,cooldown_until=NULL`;
 }
 async function sourceRun(sql:any, runId:number, source:string, fn:()=>Promise<number>):Promise<SourceResult> {
-  try { const records=await fn(); await updateHealth(sql,source); return {source,ok:true,records}; }
-  catch(e) { const error=e instanceof Error?e.message:String(e); await updateHealth(sql,source,error); return {source,ok:false,records:0,error}; }
+  try {
+    const paused=await sql`SELECT cooldown_until FROM source_health WHERE source=${source} AND cooldown_until>now() LIMIT 1`;
+    if(paused.length) return {source,ok:false,records:0,error:`COOLDOWN_ACTIVE until ${paused[0].cooldown_until}`};
+    const records=await fn(); await updateHealth(sql,source); return {source,ok:true,records};
+  } catch(e) { const error=e instanceof Error?e.message:String(e); await updateHealth(sql,source,error); return {source,ok:false,records:0,error}; }
 }
-async function collectEal(sql:any, runId:number):Promise<SourceResult> {
+async function collectEal(sql:any, runId:number, renew:()=>Promise<void>):Promise<SourceResult> {
   return sourceRun(sql,runId,"eadriatic",async()=>{
     const seasons=(await sql`SELECT external_id_a AS external_id FROM entity_mappings WHERE entity_type='eal_season' AND source_a='eadriatic' AND verified=true`).map((x:any)=>String(x.external_id));
     const ids=[...new Set(["656829288",...seasons])]; let count=0;
     for (const season of ids) {
+      await renew();
       const v=await getJson(`https://api.leaguerepublic.com/json/getMatchHub/${encodeURIComponent(season)}.json`);
       await raw(sql,runId,"eadriatic","match_hub",season,v);
       const groups=arr(v.fixtureGroupList);
       for (const group of groups) {
         for (const f of arr(group.fixtures)) {
+          await renew();
           const id=str(pick(f,"fixtureID","fixtureId")); if(!id) continue;
           const home=pick(f,"homeTeamName") ?? pick(f.homeTeam??{},"teamName","name");
           const away=pick(f,"roadTeamName") ?? pick(f.roadTeam??{},"teamName","name");
@@ -89,7 +105,7 @@ async function collectEal(sql:any, runId:number):Promise<SourceResult> {
     return count;
   });
 }
-async function collectGt(sql:any, runId:number):Promise<SourceResult> {
+async function collectGt(sql:any, runId:number, renew:()=>Promise<void>):Promise<SourceResult> {
   return sourceRun(sql,runId,"gt",async()=>{
     const headers={"Origin":"https://www.gtleagues.com","Referer":"https://www.gtleagues.com/","Accept":"application/json, text/plain, */*"};
     const sports=await getJson("https://api.gtleagues.com/api/sports",headers); await raw(sql,runId,"gt","sports",null,sports);
@@ -98,10 +114,12 @@ async function collectGt(sql:any, runId:number):Promise<SourceResult> {
     if(!sportsText.includes("soccer")) throw new Error("GT sport discovery did not identify soccer; fixtures not ingested");
     let offset=0,count=0;
     for(let page=0;page<5;page++){
+      await renew();
       const v=await getJson(`https://api.gtleagues.com/api/fixtures?offset=${offset}&limit=200&xtc=true`,headers);
       if(!Array.isArray(v)) throw new Error("GT fixtures response is not a top-level array");
       await raw(sql,runId,"gt","fixtures_page",String(offset),v);
       for(const f of v){
+        await renew();
         if(!isSoccerCompetition(f)) continue;
         const participants=gtParticipants(f);
         const stats=f.result?.stats??{};
@@ -125,14 +143,16 @@ async function collectGt(sql:any, runId:number):Promise<SourceResult> {
     return count;
   });
 }
-async function collectBetika(sql:any,runId:number):Promise<SourceResult>{
+async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>):Promise<SourceResult>{
   return sourceRun(sql,runId,"betika",async()=>{
     let count=0;
     for(let page=1;page<=3;page++){
+      await renew();
       const v=await getJson(`https://api.betika.com/v1/uo/matches?page=${page}&limit=200&sport_id=105&period_id=-1`);
       if(!Array.isArray(v?.data)) throw new Error("Betika response missing data[]");
       await raw(sql,runId,"betika","matches",String(page),v);
       for(const f of v.data){
+        await renew();
         const id=str(pick(f,"match_id","game_id","id")); if(!id) continue;
         const compId=str(pick(f,"competition_id","league_id","competitionId"));
         const comp=compId==="43822"?"eAdriatic":compId==="44877"?"GT Sports":str(pick(f,"competition_name","competition","category"));
@@ -159,31 +179,49 @@ async function collectBetika(sql:any,runId:number):Promise<SourceResult>{
 }
 async function collect(env:Env):Promise<any>{
   const sql=neon(env.DATABASE_URL);
-  const lock=await sql`INSERT INTO collection_lock(lock_name,locked_until) VALUES('scheduled',now()+interval '15 minutes')
-    ON CONFLICT(lock_name) DO UPDATE SET locked_until=EXCLUDED.locked_until
+  const ownerToken=crypto.randomUUID();
+  // A ten-minute lease is renewed at collector checkpoints. Ownership tokens prevent
+  // an expired worker from releasing a lock acquired by a newer scheduled run.
+  const lock=await sql`INSERT INTO collection_lock(lock_name,locked_until,owner_token)
+    VALUES('scheduled',now()+interval '10 minutes',${ownerToken})
+    ON CONFLICT(lock_name) DO UPDATE SET locked_until=EXCLUDED.locked_until,owner_token=EXCLUDED.owner_token
     WHERE collection_lock.locked_until<now() RETURNING lock_name`;
   if(!lock.length) return {ok:false,skipped:true,reason:"collection already running"};
   let id:number|null=null;
+  let lastRenewal=Date.now();
+  const renew=async()=>{
+    if(Date.now()-lastRenewal<30000) return;
+    const updated=await sql`UPDATE collection_lock SET locked_until=now()+interval '10 minutes'
+      WHERE lock_name='scheduled' AND owner_token=${ownerToken} RETURNING lock_name`;
+    if(!updated.length) throw new Error("COLLECTION_LOCK_LOST: this run no longer owns the scheduled lock");
+    lastRenewal=Date.now();
+  };
   try {
-    // Reconcile runs abandoned by an earlier Worker termination; do not leave them marked running forever.
+    // Reconcile runs abandoned by an earlier Worker termination; never rewrite a completed run.
     await sql`UPDATE collection_runs SET finished_at=now(),status='failed',
       summary='{"error":"stale run recovered after lock expiry"}'::jsonb
       WHERE status='running' AND started_at<now()-interval '15 minutes'`;
     const run=await sql`INSERT INTO collection_runs(status) VALUES('running') RETURNING id`;
     id=Number(run[0].id);
-    const results=await Promise.all([collectEal(sql,id),collectGt(sql,id),collectBetika(sql,id)]);
+    const results=await Promise.all([
+      collectEal(sql,id,renew),
+      collectGt(sql,id,renew),
+      collectBetika(sql,id,renew)
+    ]);
     const failures=results.filter(x=>!x.ok).length;
     const status=failures===0?"success":failures===results.length?"failed":"partial";
-    await sql`UPDATE collection_runs SET finished_at=now(),status=${status},summary=${JSON.stringify(results)}::jsonb WHERE id=${id}`;
+    await sql`UPDATE collection_runs SET finished_at=now(),status=${status},summary=${JSON.stringify(results)}::jsonb WHERE id=${id} AND status='running'`;
     return {ok:failures===0,run_id:id,status,sources:results};
   } catch(e) {
     if(id!==null) {
       const message=e instanceof Error?e.message:String(e);
-      await sql`UPDATE collection_runs SET finished_at=now(),status='failed',summary=${JSON.stringify({error:message})}::jsonb WHERE id=${id}`;
+      await sql`UPDATE collection_runs SET finished_at=now(),status='failed',summary=${JSON.stringify({error:message})}::jsonb WHERE id=${id} AND status='running'`;
     }
     throw e;
   } finally {
-    await sql`UPDATE collection_lock SET locked_until=now() WHERE lock_name='scheduled'`;
+    // Only the worker that acquired this lease may release it.
+    await sql`UPDATE collection_lock SET locked_until=now(),owner_token=NULL
+      WHERE lock_name='scheduled' AND owner_token=${ownerToken}`;
   }
 }
 async function route(request:Request,env:Env):Promise<Response>{
