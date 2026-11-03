@@ -33,7 +33,7 @@ const betikaKickoff = (value: unknown, offsetMinutes: number): string | null => 
   }
   return raw;
 };
-const RELEASE_VERSION = "0.2.2";
+const RELEASE_VERSION = "0.2.3";
 const MAX_RUN_MS = 8 * 60 * 1000;
 
 async function getJson(url: string, headers: Record<string,string> = {}, source="UPSTREAM"): Promise<any> {
@@ -484,6 +484,5 @@ async function route(request:Request,env:Env):Promise<Response>{
   return json({error:"not_found",path},404);
 }
 export default {
-  async fetch(request:Request,env:Env):Promise<Response>{try{return await route(request,env);}catch(e){const requestId=crypto.randomUUID();console.error("RUSTY_API_ERROR",requestId,e);return json({ok:false,error:"internal_error",request_id:requestId},500);}},
-  async scheduled(_event:ScheduledEvent,env:Env,ctx:ExecutionContext):Promise<void>{ctx.waitUntil(collect(env).catch(e=>{console.error("RUSTY_SCHEDULED_COLLECTION_ERROR",e);}));}
+  async fetch(request:Request,env:Env):Promise<Response>{try{return await route(request,env);}catch(e){const requestId=crypto.randomUUID();console.error("RUSTY_API_ERROR",requestId,e);return json({ok:false,error:"internal_error",request_id:requestId},500);}}
 };
