@@ -1,0 +1,9 @@
+name = "esports-edge-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-24"
+
+[vars]
+PUBLIC_API_ENABLED = "true"
+
+[triggers]
+crons = ["*/5 * * * *"]
