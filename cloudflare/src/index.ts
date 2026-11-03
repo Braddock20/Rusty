@@ -253,7 +253,7 @@ async function route(request:Request,env:Env):Promise<Response>{
     catch(e){return json({ok:false,error:"database unavailable"},503);}
   }
   if(path==="/health/db") { try {const r=await sql`SELECT now() AS database_time,current_database() AS database_name`;return json({ok:true,database:"connected",details:r[0]});}catch{return json({ok:false,database:"connection_failed"},503);} }
-  if(path==="/api/v1/collection/status"||path==="/api/v1/sources"){
+  if(path==="/api/v1/sources"){
     // Return all configured providers, including those never contacted (NULL health fields).
     const rows=await sql`SELECT expected.source,health.last_success_at,health.last_error_at,
       health.last_error,COALESCE(health.consecutive_failures,0)::int AS consecutive_failures,
@@ -262,6 +262,14 @@ async function route(request:Request,env:Env):Promise<Response>{
       LEFT JOIN source_health health ON health.source=expected.source
       ORDER BY expected.source`;
     return json({sources:rows});
+  }
+  if(path==="/api/v1/collection/status"){
+    const lockRows=await sql`SELECT lock_name,locked_until,owner_token,
+      (locked_until>now()) AS is_locked,now() AS database_time
+      FROM collection_lock WHERE lock_name='scheduled'`;
+    const recentRuns=await sql`SELECT id,status,started_at,finished_at,summary
+      FROM collection_runs ORDER BY id DESC LIMIT 5`;
+    return json({lock:lockRows[0]??null,recent_runs:recentRuns});
   }
   if(path==="/api/v1/predictions"||path==="/api/v1/predict"){
     const predictionLimit=Math.min(100,Math.max(1,Number(url.searchParams.get("limit")||30)));
