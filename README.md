@@ -26,7 +26,7 @@ No software can guarantee that third-party APIs, Cloudflare or a database will n
 - Team identity is source-scoped and requires explicit upstream team IDs. Names are labels, not identity keys.
 - Forecasts remain shadow-only until chronological walk-forward validation and calibration pass. Bookmaker odds are not model inputs.
 
-The existing 212 recovered eAdriatic fixtures are preserved. Migration 0006 gives existing fixtures `result_state='unknown'` rather than guessing that their scores mean they are completed. They remain available from `/api/v1/fixtures`; they are excluded from `/api/v1/results` and predictive history until a provider explicitly confirms completion.
+The existing 212 recovered eAdriatic fixtures are preserved. Migrations 0006 and 0007 give existing fixtures `result_state='unknown'` rather than guessing that their scores mean they are completed. They remain available from `/api/v1/fixtures`; they are excluded from `/api/v1/results` and predictive history until a provider explicitly confirms completion.
 
 ## Requirements
 
@@ -98,7 +98,7 @@ scripts/test-local.sh --live          # same, but calls the real upstream APIs
 scripts/test-local.sh --db=postgres://user:pass@localhost:5432/mydb
 ```
 
-The script creates the database, applies migrations 0001–0006, runs the test suite,
+The script creates the database, applies migrations 0001–0007, runs the test suite,
 starts the Worker on port 8788 (`scripts/local-server.ts`) and runs
 `cloudflare/test/smoke.ts` against it. It exits non-zero if anything fails.
 
@@ -140,11 +140,13 @@ recent `last_attempt_at`.
 
 ## Deploy Cloudflare Worker
 
-Apply migrations 0001 through 0005 if they have not already been applied. Then apply the new additive hardening migration:
+Apply any missing migrations in order. For an existing database already on migration 0006, apply the new additive timestamp migration:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0006_production_hardening.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0007_canonical_kickoff.sql
 ```
+
+For a fresh database, apply all migrations `0001` through `0007` in filename order.
 
 From `cloudflare/`:
 
@@ -157,7 +159,7 @@ npx wrangler deploy
 
 The existing `*/5 * * * *` Cron Trigger is retained. The Worker reads `DATABASE_URL` from its secret. Set `ADMIN_TOKEN` only if you want the authenticated manual endpoint `/api/v1/collection/run`; use `npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
 
-Do not manually trigger a collection until migration 0006 has completed and the Worker deployment has finished. A previously active lease from an older deployment may need to expire before the new collector can acquire it.
+Do not manually trigger a collection until migrations 0006 and 0007 have completed and the Worker deployment has finished. A previously active lease from an older deployment may need to expire before the new collector can acquire it.
 
 ## Data model
 
@@ -182,8 +184,8 @@ Do not manually trigger a collection until migration 0006 has completed and the 
 
 ## First production deployment checklist
 
-1. Confirm migrations 0001 through 0005 are already applied.
-2. Apply `rust-engine/migrations/0006_production_hardening.sql` to Neon.
+1. Confirm migrations 0001 through 0006 are already applied.
+2. Apply `rust-engine/migrations/0007_canonical_kickoff.sql` to Neon.
 3. Confirm the Worker has its `DATABASE_URL` secret and the correct account/environment.
 4. Run `npm test` and `npx tsc --noEmit` from `cloudflare/`.
 5. Deploy the Worker.
@@ -213,11 +215,12 @@ Operational endpoints:
 - `GET /api/v1/collection/status` — lease owner, run heartbeat, recent runs and pagination cursors.
 - `GET /api/v1/runs?limit=25` — run history.
 - `GET /api/v1/fixtures` — all normalized fixtures, including ambiguous historical rows.
+- `GET /api/v1/fixtures/upcoming` — only fixtures with an explicit normalized kickoff later than database time.
 - `GET /api/v1/results` — only explicitly completed fixtures with valid scores.
 
 ## Odds-free prediction engine (experimental shadow mode)
 
-Migrations 0003 and 0004 provide the prediction schema; migration 0006 adds the hardening and forecast-claim tables. The Worker exposes:
+Migrations 0003 and 0004 provide the prediction schema; migration 0006 adds the hardening and forecast-claim tables; migration 0007 adds canonical kickoff timestamps. The Worker exposes:
 
 - `GET /api/v1/predictions?limit=30` — upcoming fixtures with experimental, odds-free model forecasts; optionally filter with `&source=betika`, `eadriatic`, or `gt`.
 - `GET /api/v1/predict` — alias for the same endpoint.
@@ -242,11 +245,11 @@ Predictions remain odds-free and shadow-only. `probabilities` are model estimate
 
 ### Production hardening release
 
-Migration `0006_production_hardening.sql` is additive. It adds run ownership/heartbeat fields, source attempt diagnostics, explicit result state, explicit home/away team IDs, durable pagination checkpoints, and a unique forecast-claim table. It does not delete or rewrite the 212 recovered eAdriatic records or existing forecast history. Existing fixture result states default to `unknown` by design.
+Migrations `0006_production_hardening.sql` and `0007_canonical_kickoff.sql` are additive. It adds run ownership/heartbeat fields, source attempt diagnostics, explicit result state, explicit home/away team IDs, durable pagination checkpoints, and a unique forecast-claim table. It does not delete or rewrite the 212 recovered eAdriatic records or existing forecast history. Existing fixture result states default to `unknown` by design. Migration 0007 backfills kickoff timestamps only from explicit epoch or offset-bearing values; timezone-less provider clock strings remain unresolved.
 
 The Worker test suite includes provider-status classification, malformed/empty JSON handling, retry policy, safe query bounds, timestamp ambiguity rejection, and normalization tests. A TypeScript syntax/type pass can be run with the project's installed dependencies; live Neon/Cloudflare integration and live provider calls must still be verified after deployment.
 
-The Rust service remains experimental and is not covered by this Worker patch. Do not deploy both Rust and Worker collectors against the same Neon database as parallel scheduled writers.
+The Rust service remains experimental. Its fixture upsert and migration runner understand migration 0007, but it still lacks the Worker's production collection lease and must not be deployed as a parallel writer against the same Neon database.
 
 ### Required next data capabilities
 
