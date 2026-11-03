@@ -11,10 +11,24 @@ import pg from "pg";
 
 const { Pool } = pg;
 
-/** Neon raw-text output returns every value as its PostgreSQL text representation. */
+/**
+ * Neon raw-text output returns every value as its PostgreSQL text representation.
+ * Timestamps must use the PostgreSQL wire format ("2026-11-03 20:44:04.540000+00"),
+ * which is what the Neon server sends and what the driver's parser expects. Sending
+ * ISO-8601 instead makes the driver resolve every timestamp column to null.
+ */
+function toPgTimestamp(date: Date): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return (
+    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ` +
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}.` +
+    `${pad(date.getUTCMilliseconds(), 3)}000+00`
+  );
+}
+
 function toText(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return toPgTimestamp(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "bigint") return value.toString();
   if (typeof value === "number") return Number.isFinite(value) ? String(value) : String(value);
@@ -134,10 +148,13 @@ type Fetch = typeof globalThis.fetch;
  * Routes the Neon driver's SQL traffic to the local shim and everything else to the
  * supplied provider handler. The Neon driver is identified by its own connection-string
  * header, so provider traffic is never mistaken for database traffic.
+ *
+ * When no provider handler is supplied, upstream traffic is passed through to the real
+ * network untouched.
  */
 export function installFetchStub(
   shimUrl: string,
-  providerHandler: (url: string, init?: RequestInit) => Response | Promise<Response>,
+  providerHandler?: (url: string, init?: RequestInit) => Response | Promise<Response>,
 ): () => void {
   const realFetch: Fetch = globalThis.fetch;
   globalThis.fetch = (async (input: any, init?: any) => {
@@ -150,7 +167,8 @@ export function installFetchStub(
     if (isNeon) {
       return realFetch(shimUrl, { method: "POST", headers: { "content-type": "application/json" }, body: init?.body });
     }
-    return providerHandler(url, init);
+    if (providerHandler) return providerHandler(url, init);
+    return realFetch(input, init);
   }) as Fetch;
   return () => {
     globalThis.fetch = realFetch;
