@@ -21,19 +21,36 @@ pub async fn collect(s: &AppState, run_id: i64) -> Outcome {
         match get_json(s,&url).await {
             Ok(v)=>{
                 if let Err(e)=db::save_raw(&s.pool,run_id,"eadriatic","match_hub",Some(season),&v).await { errs.push(e.to_string()); continue; }
-                for row in normalize::walk_records(&v) {
+                // LeagueRepublic nests fixtures under fixtureGroupList[].fixtures[].
+                let rows = normalize::eal_fixture_rows(&v);
+                if rows.is_empty() {
+                    errs.push(format!("season {season}: no fixtures found in the match hub payload"));
+                }
+                for (group,row) in rows {
                     let id=normalize::fixture_id(row,&["fixtureID","fixtureId","id","matchID"]).unwrap_or_else(||format!("{}-{}",season,total));
                     let hs=normalize::text(row,&["homeScore","home_score"]);
                     let as_=normalize::text(row,&["roadScore","awayScore","away_score"]);
-                    let _=db::save_fixture(&s.pool,"eadriatic",&id,
-                        normalize::text(row,&["fixtureGroupDescription","competition","fixtureGroupName"]).as_deref(),
-                        normalize::text(row,&["homeTeam","homeTeamName"]).as_deref(),
-                        normalize::text(row,&["roadTeam","awayTeam","roadTeamName"]).as_deref(),
-                        normalize::text(row,&["fixtureDate","fixtureDateInMilliseconds"]).as_deref(),
-                        normalize::text(row,&["fixtureStatus","status","approved"]).as_deref(),
-                        hs.as_deref(),as_.as_deref(),row).await;
-                    let _=db::save_score(&s.pool,"eadriatic",&id,
-                        normalize::text(row,&["fixtureStatus","status","approved"]).as_deref(),hs.as_deref(),as_.as_deref(),row).await;
+                    // Names come from the *_TeamName fields; homeTeam/roadTeam are numeric ids.
+                    let home=normalize::text_str(row,&["homeTeamName","homeName"]);
+                    let away=normalize::text_str(row,&["roadTeamName","awayName"]);
+                    let competition=normalize::text_str(group,&["fixtureGroupDesc","fixtureGroupName","fixtureGroupDescription"]);
+                    // fixtureDate is a timezone-less local string; the epoch field is unambiguous.
+                    let kickoff=normalize::text(row,&["fixtureDateInMilliseconds","fixtureDate"]);
+                    let status=normalize::text_str(row,&["fixtureStatusDesc","fixtureDateStatusDesc","fixtureStatus"]);
+                    let home_id=normalize::text(row,&["homeTeam","homeTeamID"]);
+                    let away_id=normalize::text(row,&["roadTeam","roadTeamID"]);
+                    if let Err(e)=db::save_fixture(&s.pool,"eadriatic",&id,
+                        competition.as_deref(),home.as_deref(),away.as_deref(),
+                        kickoff.as_deref(),status.as_deref(),hs.as_deref(),as_.as_deref(),
+                        home_id.as_deref(),away_id.as_deref(),row).await {
+                        errs.push(format!("{id}: {e}"));
+                        continue;
+                    }
+                    if let Err(e)=db::save_score(&s.pool,"eadriatic",&id,
+                        status.as_deref(),hs.as_deref(),as_.as_deref(),row).await {
+                        errs.push(format!("{id}: {e}"));
+                        continue;
+                    }
                     total+=1;
                 }
             },
