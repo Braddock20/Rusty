@@ -1,9 +1,40 @@
 /** Defensive parsing and source-status classification shared by collectors and tests. */
 export type ResultState = "unknown" | "scheduled" | "live" | "completed" | "cancelled" | "postponed";
 
-export function classifyResultState(_source: string, status: unknown, payload: any = null): ResultState {
-  const parts = [status, payload?.fixtureStatusDesc, payload?.fixtureDateStatusDesc,
-    payload?.status, payload?.status_name, payload?.match_status]
+/**
+ * GT Sports Leagues exposes fixture status as a numeric enum rather than a label
+ * (verified against https://api.gtleagues.com/api/fixtures). Without this mapping
+ * every GT fixture stayed `unknown` and no GT match could ever be a result.
+ */
+const GT_STATUS_BY_CODE: Record<string, ResultState> = {
+  "0": "scheduled", // not_started
+  "1": "live", // live
+  "2": "postponed", // suspended
+  "3": "completed", // ended
+  "4": "cancelled", // cancelled
+  "5": "postponed", // postponed
+  "6": "cancelled", // forfeit
+  "10": "unknown", // unknown
+};
+
+const numericCode = (value: unknown): string | null => {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && /^\d{1,3}$/.test(value.trim())) return value.trim();
+  return null;
+};
+
+export function classifyResultState(source: string, status: unknown, payload: any = null): ResultState {
+  const candidates = [status, payload?.fixtureStatusDesc, payload?.fixtureDateStatusDesc,
+    payload?.status, payload?.status_name, payload?.match_status];
+  // A numeric provider status is an explicit machine-readable signal. Map it before
+  // falling back to label matching, so "3" is never compared against a keyword.
+  if (source === "gt") {
+    for (const candidate of candidates) {
+      const code = numericCode(candidate);
+      if (code !== null) return GT_STATUS_BY_CODE[code] ?? "unknown";
+    }
+  }
+  const parts = candidates
     .filter((x) => x !== null && x !== undefined)
     .map((x) => String(x).trim().toLowerCase());
   const text = parts.join(" | ");
@@ -26,7 +57,12 @@ export function validScore(value: unknown): boolean {
 }
 
 export function safeInt(value: unknown, fallback: number, min: number, max: number): number {
-  const n = Number(value);
+  // A missing or blank parameter must fall back to the documented default.
+  // Number(null) is 0, which silently collapsed every default limit to the minimum.
+  if (value === null || value === undefined) return fallback;
+  const text = String(value).trim();
+  if (text === "") return fallback;
+  const n = Number(text);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.trunc(n))) : fallback;
 }
 
