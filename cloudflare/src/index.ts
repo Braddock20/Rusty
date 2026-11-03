@@ -1,9 +1,9 @@
-import { gtParticipants, gtPlayerParticipants, isSoccerCompetition } from "./normalize";
+import { gtParticipants, gtPlayerParticipants, isSoccerCompetition, soccerSportIds, ealStandingsTables, ealTeamId } from "./normalize.ts";
 import { neon } from "@neondatabase/serverless";
-import { buildPredictions } from "./prediction";
-import { classifyResultState, parseJsonBody, isRetryableStatus, safeInt } from "./guards";
+import { buildPredictions } from "./prediction.ts";
+import { classifyResultState, parseJsonBody, isRetryableStatus, safeInt } from "./guards.ts";
 
-interface Env { DATABASE_URL: string; ADMIN_TOKEN?: string; }
+interface Env { DATABASE_URL: string; ADMIN_TOKEN?: string; BETIKA_UTC_OFFSET_MINUTES?: string; }
 type Obj = Record<string, any>;
 type SourceResult = { source: string; ok: boolean; records: number; error?: string };
 const json = (body: unknown, status = 200) => Response.json(body, { status, headers: {"Cache-Control":"no-store", "X-Content-Type-Options":"nosniff"} });
@@ -12,6 +12,27 @@ const arr = (v: unknown): any[] => Array.isArray(v) ? v : [];
 const numberOrNull = (v:unknown):number|null => { if(v===null||v===undefined||v==="") return null; const n=Number(v); return Number.isFinite(n)?n:null; };
 const pick = (o: Obj, ...keys: string[]) => { for (const k of keys) if (o?.[k] !== undefined && o[k] !== null) return o[k]; return null; };
 const timeout = (ms: number) => AbortSignal.timeout(ms);
+/**
+ * Betika publishes `start_time` as a timezone-less local clock string
+ * ("2026-11-03 23:15:00"). An ambiguous local string is never guessed: the
+ * operator confirms the provider offset explicitly with BETIKA_UTC_OFFSET_MINUTES
+ * (180 = UTC+3, the provider's published East Africa Time). Without it the raw
+ * string is kept and simply never becomes a forecast candidate.
+ */
+const betikaKickoff = (value: unknown, offsetMinutes: number): string | null => {
+  const raw = str(value);
+  if (!raw) return null;
+  if (/^\d{10,13}$/.test(raw)) return raw;
+  if (/(Z|[+-]\d{2}:?\d{2})$/i.test(raw)) return raw;
+  if (Number.isFinite(offsetMinutes) && offsetMinutes !== 0) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(raw.trim());
+    if (m) {
+      const utcMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] ?? 0)) - offsetMinutes * 60000;
+      return String(utcMs);
+    }
+  }
+  return raw;
+};
 const MAX_RUN_MS = 8 * 60 * 1000;
 const HEARTBEAT_MS = 30000;
 
@@ -126,23 +147,28 @@ async function collectEal(sql:any, runId:number, renew:()=>Promise<void>):Promis
       if(!Array.isArray(v?.fixtureGroupList)) throw new Error("EADRIATIC_INVALID_MATCH_HUB_SCHEMA: fixtureGroupList[] missing");
       const groups=arr(v.fixtureGroupList);
       for (const group of groups) {
+        // LeagueRepublic names a group `fixtureGroupDesc`; the previous keys never matched.
+        const competition=pick(group,"fixtureGroupDesc","fixtureGroupName","name","description");
         for (const f of arr(group.fixtures)) {
           await renew();
           const id=str(pick(f,"fixtureID","fixtureId")); if(!id) continue;
           const home=pick(f,"homeTeamName") ?? pick(f.homeTeam??{},"teamName","name");
           const away=pick(f,"roadTeamName") ?? pick(f.roadTeam??{},"teamName","name");
-          await upsertFixture(sql,runId,"eadriatic",id,pick(group,"fixtureGroupName","name","description"),home,away,
-            pick(f,"fixtureDate","fixtureDateInMilliseconds"),`${[str(pick(f,"fixtureStatusDesc","fixtureStatus")),str(pick(f,"fixtureDateStatusDesc"))].filter(Boolean).join(" / ")}${f.approved===undefined?"":` approved=${f.approved}`}`,
+          await upsertFixture(sql,runId,"eadriatic",id,competition,home,away,
+            // `fixtureDate` is a timezone-less local string ("20260916 07:00") and was
+            // unusable for forecasting; `fixtureDateInMilliseconds` is an unambiguous epoch.
+            pick(f,"fixtureDateInMilliseconds","fixtureDate"),`${[str(pick(f,"fixtureStatusDesc","fixtureStatus")),str(pick(f,"fixtureDateStatusDesc"))].filter(Boolean).join(" / ")}${f.approved===undefined?"":` approved=${f.approved}`}`,
             pick(f,"homeScore"),pick(f,"roadScore","awayScore"),f,
-            pick(f,"homeTeamID","homeTeamId")??pick(f.homeTeam??{},"teamID","teamId","id"),
-            pick(f,"roadTeamID","awayTeamID","roadTeamId","awayTeamId")??pick(f.roadTeam??{},"teamID","teamId","id"),
+            ealTeamId(pick(f,"homeTeamID","homeTeamId") ?? f.homeTeam),
+            ealTeamId(pick(f,"roadTeamID","awayTeamID","roadTeamId","awayTeamId") ?? f.roadTeam),
             pick(group,"fixtureGroupIdentifier","fixtureTypeID")); count++;
         }
-        for (const table of arr(group.standings)) for (const line of arr(table.standingsLines)) {
+        // `standings` is a single {standingsDesc, standingsLines} object upstream.
+        for (const table of ealStandingsTables(group)) for (const line of arr(table.standingsLines)) {
           await renew();
           const teamId=str(pick(line,"teamID")); if(!teamId) continue;
           await sql`INSERT INTO standings(source,competition,external_team_id,team_name,position,points,played,won,tied,lost,score_for,score_against,win_percentage,recent_form,payload,observed_at)
-            VALUES('eadriatic',${str(pick(group,"fixtureGroupName","name"))},${teamId},${str(pick(line,"teamName"))},${numberOrNull(pick(line,"position"))},${numberOrNull(pick(line,"points"))},${numberOrNull(pick(line,"overallPlayed"))},${numberOrNull(pick(line,"overallWon"))},${numberOrNull(pick(line,"overallTied"))},${numberOrNull(pick(line,"overallLoss"))},${numberOrNull(pick(line,"overallScoreFor"))},${numberOrNull(pick(line,"overallScoreAgainst"))},${numberOrNull(pick(line,"overallWinPercentage"))},${str(pick(line,"recentForm"))},${JSON.stringify(line)}::jsonb,now())`;
+            VALUES('eadriatic',${str(competition)},${teamId},${str(pick(line,"teamName"))},${numberOrNull(pick(line,"position"))},${numberOrNull(pick(line,"points"))},${numberOrNull(pick(line,"overallPlayed"))},${numberOrNull(pick(line,"overallWon"))},${numberOrNull(pick(line,"overallTied"))},${numberOrNull(pick(line,"overallLoss"))},${numberOrNull(pick(line,"overallScoreFor"))},${numberOrNull(pick(line,"overallScoreAgainst"))},${numberOrNull(pick(line,"overallWinPercentage"))},${str(pick(line,"recentForm"))},${JSON.stringify(line)}::jsonb,now())`;
         }
       }
       const nextSeason=ids[(startIndex+batch+1)%ids.length];
@@ -162,8 +188,11 @@ async function collectGt(sql:any, runId:number, renew:()=>Promise<void>):Promise
     const sports=await getJson("https://api.gtleagues.com/api/sports",headers,"GT"); await renew(); await raw(sql,runId,"gt","sports",null,sports);
     await renew();
     const seasons=await getJson("https://api.gtleagues.com/api/seasons?status=1",headers,"GT"); await renew(); await raw(sql,runId,"gt","active_seasons",null,seasons);
-    const sportsText=JSON.stringify(sports).toLowerCase();
-    if(!sportsText.includes("soccer")) throw new Error("GT sport discovery did not identify soccer; fixtures not ingested");
+    // GT marks football competitions with sport.tagId="soccer" (NBA 2k21 is "basketball").
+    // The sport names are FIFA20/FIFA21/FIFA22/FIFA23/FC25, so a name match alone
+    // rejected every GT fixture and the source silently ingested nothing.
+    const soccerIds=soccerSportIds(sports);
+    if(!soccerIds.size) throw new Error("GT sport discovery did not identify a soccer competition; fixtures not ingested");
     const checkpoint=await sql`SELECT cursor FROM collection_checkpoints WHERE source='gt' AND dataset='fixtures' LIMIT 1`;
     const [savedOffset,savedRow]=String(checkpoint[0]?.cursor??"0:0").split(":");
     let offset=Math.max(0,Number(savedOffset)||0),resumeRow=Math.max(0,Number(savedRow)||0),count=0;
@@ -176,7 +205,7 @@ async function collectGt(sql:any, runId:number, renew:()=>Promise<void>):Promise
       for(let rowIndex=resumeRow;rowIndex<v.length;rowIndex++){
         const f=v[rowIndex];
         await renew();
-        if(!isSoccerCompetition(f)) { if((rowIndex+1)%10===0) await sql`INSERT INTO collection_checkpoints(source,dataset,cursor,updated_at) VALUES('gt','fixtures',${`${offset}:${rowIndex+1}`},now()) ON CONFLICT(source,dataset) DO UPDATE SET cursor=EXCLUDED.cursor,updated_at=now()`; continue; }
+        if(!isSoccerCompetition(f,soccerIds)) { if((rowIndex+1)%10===0) await sql`INSERT INTO collection_checkpoints(source,dataset,cursor,updated_at) VALUES('gt','fixtures',${`${offset}:${rowIndex+1}`},now()) ON CONFLICT(source,dataset) DO UPDATE SET cursor=EXCLUDED.cursor,updated_at=now()`; continue; }
         const participants=gtParticipants(f);
         const stats=f.result?.stats??{};
         const id=str(pick(f,"id")); if(!id) continue;
@@ -207,7 +236,7 @@ async function collectGt(sql:any, runId:number, renew:()=>Promise<void>):Promise
     return count;
   },renew);
 }
-async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>):Promise<SourceResult>{
+async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>,offsetMinutes=NaN):Promise<SourceResult>{
   return sourceRun(sql,runId,"betika",async()=>{
     const checkpoint=await sql`SELECT cursor FROM collection_checkpoints WHERE source='betika' AND dataset='matches' LIMIT 1`;
     const [savedPage,savedRow]=String(checkpoint[0]?.cursor??"1:0").split(":");
@@ -226,7 +255,7 @@ async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>):Promi
         const compId=str(pick(f,"competition_id","league_id","competitionId"));
         const comp=compId==="43822"?"eAdriatic":compId==="44877"?"GT Sports":str(pick(f,"competition_name","competition","category"));
         await upsertFixture(sql,runId,"betika",id,comp,pick(f,"home_team","homeTeam"),pick(f,"away_team","awayTeam"),
-          pick(f,"start_time","match_time","date"),pick(f,"status"),pick(f,"home_score"),pick(f,"away_score"),f,
+          betikaKickoff(pick(f,"start_time","match_time","date"),offsetMinutes),pick(f,"status"),pick(f,"home_score"),pick(f,"away_score"),f,
           pick(f,"home_team_id","homeTeamId"),pick(f,"away_team_id","awayTeamId"),compId);
         for(const market of arr(f.odds)){
           const marketName=str(pick(market,"name","sub_type_name","sub_type_id","market_name"))??"unknown";
@@ -257,23 +286,30 @@ async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>):Promi
 async function collect(env:Env):Promise<any>{
   const sql=neon(env.DATABASE_URL);
   const ownerToken=crypto.randomUUID();
-  // Atomically acquire the lease AND create its run row. A scheduled invocation
-  // cannot leave a lock without a corresponding run, or create a run without ownership.
-  const acquired=await sql`WITH lease AS (
-      INSERT INTO collection_lock(lock_name,locked_until,owner_token,run_id)
+  // Acquire the lease AND create the linked run in one transaction.
+  // A single statement cannot express this: a data-modifying CTE's write is not
+  // visible to the main query of the same statement, so `collection_lock.run_id`
+  // could never be linked. The result was that every collection aborted with
+  // "collection already running", the lease was never released, source health was
+  // never written and every run stayed stuck in 'running'.
+  const [leaseRows,linkRows]=await sql.transaction([
+    sql`INSERT INTO collection_lock(lock_name,locked_until,owner_token,run_id)
       VALUES('scheduled',now()+interval '3 minutes',${ownerToken},NULL)
       ON CONFLICT(lock_name) DO UPDATE SET locked_until=EXCLUDED.locked_until,owner_token=EXCLUDED.owner_token,run_id=NULL
       WHERE collection_lock.locked_until<=now()
-      RETURNING lock_name
-    ), created AS (
-      INSERT INTO collection_runs(status,owner_token,heartbeat_at)
-      SELECT 'running',${ownerToken},now() FROM lease RETURNING id
-    )
-    UPDATE collection_lock l SET run_id=c.id,locked_until=now()+interval '3 minutes'
-    FROM created c WHERE l.lock_name='scheduled' AND l.owner_token=${ownerToken}
-    RETURNING l.run_id`;
-  if(!acquired.length) return {ok:false,skipped:true,reason:"collection already running"};
-  const id=Number(acquired[0].run_id);
+      RETURNING lock_name`,
+    sql`WITH created AS (
+        INSERT INTO collection_runs(status,owner_token,heartbeat_at)
+        SELECT 'running',${ownerToken},now()
+        WHERE EXISTS(SELECT 1 FROM collection_lock WHERE lock_name='scheduled' AND owner_token=${ownerToken} AND locked_until>now())
+        RETURNING id
+      ) UPDATE collection_lock l SET run_id=c.id,locked_until=now()+interval '3 minutes'
+      FROM created c WHERE l.lock_name='scheduled' AND l.owner_token=${ownerToken}
+      RETURNING l.run_id`
+  ]);
+  if(!leaseRows.length) return {ok:false,skipped:true,reason:"collection already running"};
+  if(!linkRows.length) throw new Error("COLLECTION_LEASE_LINK_FAILED: lease acquired but the run could not be linked");
+  const id=Number(linkRows[0].run_id);
   const started=Date.now();
   let heartbeatStopped=false;
   const wakeHeartbeat:{current:(()=>void)|null}={current:null};
@@ -322,7 +358,7 @@ async function collect(env:Env):Promise<any>{
     // while other collectors are still writing. Each source failure is isolated.
     results.push(await collectEal(sql,id,renew));
     results.push(await collectGt(sql,id,renew));
-    results.push(await collectBetika(sql,id,renew));
+    results.push(await collectBetika(sql,id,renew,Number(env.BETIKA_UTC_OFFSET_MINUTES ?? "")));
     if(heartbeatError) throw new Error(`COLLECTION_HEARTBEAT_FAILED: ${String(heartbeatError)}`);
     if(!results.length) throw new Error("NO_SOURCES_CONFIGURED");
     const failures=results.filter(x=>!x.ok).length;
@@ -377,10 +413,14 @@ async function route(request:Request,env:Env):Promise<Response>{
     await sql`UPDATE prediction_history p SET actual_outcome=NULL,settled_at=NULL
       FROM fixtures f WHERE p.source=f.source AND p.external_fixture_id=f.external_id AND p.settled_at IS NOT NULL
       AND (f.result_state<>'completed' OR f.home_score_raw IS NULL OR f.home_score_raw !~ '^[0-9]+$' OR f.away_score_raw IS NULL OR f.away_score_raw !~ '^[0-9]+$')`;
-    await sql`UPDATE prediction_history p SET actual_outcome=CASE WHEN f.home_score_raw::numeric>f.away_score_raw::numeric THEN 'HOME' WHEN f.home_score_raw::numeric<f.away_score_raw::numeric THEN 'AWAY' ELSE 'DRAW' END, settled_at=now()
-      FROM fixtures f WHERE p.source=f.source AND p.external_fixture_id=f.external_id AND (p.settled_at IS NULL OR p.actual_outcome IS DISTINCT FROM CASE WHEN f.home_score_raw::numeric>f.away_score_raw::numeric THEN 'HOME' WHEN f.home_score_raw::numeric<f.away_score_raw::numeric THEN 'AWAY' ELSE 'DRAW' END)
-      AND f.result_state='completed'
-      AND f.home_score_raw ~ '^[0-9]+$' AND f.away_score_raw ~ '^[0-9]+$'`;
+    await sql`WITH scored AS (
+        SELECT f.source AS source,f.external_id AS external_id,
+          CASE WHEN f.home_score_raw ~ '^[0-9]+$' AND f.away_score_raw ~ '^[0-9]+$'
+               THEN f.home_score_raw::numeric - f.away_score_raw::numeric END AS diff
+        FROM fixtures f WHERE f.result_state='completed'
+      ) UPDATE prediction_history p SET actual_outcome=CASE WHEN s.diff>0 THEN 'HOME' WHEN s.diff<0 THEN 'AWAY' ELSE 'DRAW' END, settled_at=now()
+      FROM scored s WHERE p.source=s.source AND p.external_fixture_id=s.external_id AND s.diff IS NOT NULL
+        AND (p.settled_at IS NULL OR p.actual_outcome IS DISTINCT FROM CASE WHEN s.diff>0 THEN 'HOME' WHEN s.diff<0 THEN 'AWAY' ELSE 'DRAW' END)`;
     const rows=await sql`SELECT model_version,count(*)::int AS settled,
       count(*) FILTER (WHERE predicted_outcome=actual_outcome)::int AS correct,
       round(100.0*count(*) FILTER (WHERE predicted_outcome=actual_outcome)/NULLIF(count(*),0),2) AS accuracy_percent,
