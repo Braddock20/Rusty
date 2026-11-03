@@ -12,7 +12,11 @@ test("GT reads participants by side and nested nickname/team",()=>{
   assert.deepEqual(gtParticipants({participants:[
     {side:"home",participant:{player:{nickname:"Alpha"}}},
     {side:"away",participant:{team:{name:"Beta"}}}
-  ]}),{home:"Alpha",away:"Beta"});
+  ]}),{home:"Alpha",away:"Beta",homeTeamId:null,awayTeamId:null});
+  assert.deepEqual(gtParticipants({participants:[
+    {side:"home",participant:{player:{nickname:"Alpha"},team:{id:41}}},
+    {side:"away",participant:{team:{name:"Beta",id:42}}}
+  ]}),{home:"Alpha",away:"Beta",homeTeamId:"41",awayTeamId:"42"});
 });
 test("Betika traverses markets then nested selections",()=>{
   const rows=betikaSelections({odds:[{sub_type_id:1,odds:[{display:"1",odd_key:"Home",odd_value:"1.93"},{display:"X",odd_key:"Draw",odd_value:"3.2"}]}]});
