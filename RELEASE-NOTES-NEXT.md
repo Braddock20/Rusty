@@ -44,3 +44,11 @@ These limitations are intentionally explicit; no deployment or production verifi
 - Added a collector preflight that refuses to call providers against a schema missing `kickoff_at`, with an actionable migration error.
 - Added a Cloudflare-local copy of migration 0007.
 - Separated the 20 dependency-free unit tests from the destructive database integration suite; `npm test` no longer accidentally loads the integration helper.
+
+
+## 0.2.2 — checkpoint-driven collection lease renewal
+
+- Removed dependence on a background timer to keep the scheduled collection lease alive.
+- Every collector progress checkpoint now renews the lock and updates the run heartbeat in the same database statement.
+- A lease is renewed only while the current run still owns the matching lock/run pair; lost ownership fails safely.
+- Unit tests: 20/20 pass. TypeScript typecheck remains blocked in this environment by the missing `@cloudflare/workers-types` installation.
