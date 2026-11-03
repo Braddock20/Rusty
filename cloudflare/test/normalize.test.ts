@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ealFixtures, ealStandings, gtParticipants, betikaSelections, isSoccerCompetition, validOdds } from "../src/normalize.ts";
+import { ealFixtures, ealStandings, gtParticipants, gtPlayerParticipants, betikaSelections, isSoccerCompetition, validOdds } from "../src/normalize.ts";
 
 test("eAdriatic flattens overlapping fixture groups using actual fixture IDs",()=>{
   const x={fixtureGroupList:[{fixtures:[{fixtureID:"m1"}],standings:[{standingsLines:[{teamID:"t1"}]}]},{fixtures:[{fixtureID:"m1"},{fixtureID:"m2"}]}]};
@@ -23,3 +23,11 @@ test("GT filter accepts eSoccer and rejects unrelated football labels",()=>{
   assert.equal(isSoccerCompetition({season:{tournament:{category:{sport:{name:"Basketball"}}}}}),false);
 });
 test("invalid odds are rejected",()=>{assert.equal(validOdds(1.93),true);assert.equal(validOdds(1),false);assert.equal(validOdds(NaN),false);});
+
+test("GT player/team identity requires explicit IDs and preserves unknown starter status",()=>{
+  const got=gtPlayerParticipants({participants:[
+    {side:"home",participant:{player:{id:17,nickname:"Alpha"},team:{id:4,name:"Team Red"}}},
+    {side:"away",participant:{player:{nickname:"No ID"},team:{id:5,name:"Team Blue"}}}
+  ]});
+  assert.equal(got.length,1); assert.equal(got[0].playerId,"17"); assert.equal(got[0].teamId,"4"); assert.equal(got[0].isStarter,null);
+});
