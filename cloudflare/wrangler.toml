@@ -1,6 +1,6 @@
 name = "esports-edge-api"
 main = "src/index.ts"
-compatibility_date = "2025-01-24"
+compatibility_date = "2026-11-03"
 
 [vars]
 PUBLIC_API_ENABLED = "true"
