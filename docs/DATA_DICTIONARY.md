@@ -2,13 +2,20 @@
 
 ## Identity
 Use `(source, external_id)` as the source-local fixture key. Do not join EAL/GT to Betika
-by display name alone. Create `entity_mappings` rows only after human verification.
+by display name alone. Competition history requires explicit `competition_external_id`; team-specific history
+requires explicit `home_team_external_id` and `away_team_external_id`; names are labels only. Create `entity_mappings` rows only after human verification.
 
 ## Historical observations
 - `raw_snapshots`: exact JSON response bodies, timestamped by ingestion.
-- `score_observations`: each score/status observation, including repeated unchanged states.
+- `score_observations`: append-only observations when score/status/result-state changes.
 - `odds_observations`: each bookmaker selection price observed at collection time.
-- `fixtures`: latest known normalized state, not a history table.
+- `fixtures`: latest known normalized state, not a history table. `result_state` is one of
+  `unknown`, `scheduled`, `live`, `completed`, `cancelled`, or `postponed`; ambiguous historical
+  rows remain `unknown` until an explicit provider status is observed.
+- `collection_checkpoints`: resumable provider pagination cursor; `last_complete_at` is set only
+  when a short/empty final page proves the current offset crawl reached its end.
+- `prediction_forecast_keys`: atomic uniqueness claim preventing duplicate first forecasts per
+  source, fixture and model version.
 
 ## Baseline analysis features
 1. Player/participant rolling win, draw, loss and goal rates from verified completed fixtures.
