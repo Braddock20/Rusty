@@ -36,3 +36,11 @@ The operator-reported latest live run collected 200 GT fixtures and 212 eAdriati
 - No Neon credentials or deployed Worker access were supplied, so migration 0007 and the updated Worker have not been applied to production or live-tested here.
 
 These limitations are intentionally explicit; no deployment or production verification is claimed.
+
+
+## 0.2.1 — deployment diagnostics and clean test entrypoint
+- Added a release identifier to health and collection-status responses.
+- Added non-secret database/schema fingerprinting, including whether the active search path resolves `fixtures.kickoff_at`.
+- Added a collector preflight that refuses to call providers against a schema missing `kickoff_at`, with an actionable migration error.
+- Added a Cloudflare-local copy of migration 0007.
+- Separated the 20 dependency-free unit tests from the destructive database integration suite; `npm test` no longer accidentally loads the integration helper.
