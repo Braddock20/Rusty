@@ -1,29 +1,60 @@
+
+import { neon } from "@neondatabase/serverless";
+
 interface Env {
-  ENGINE_URL: string;
-  ENGINE_TOKEN: string;
-  PUBLIC_API_ENABLED: string;
+  DATABASE_URL: string;
 }
-async function engine(env: Env, path: string, init: RequestInit = {}) {
-  return fetch(new URL(path, env.ENGINE_URL), {
-    ...init,
-    headers: { ...(init.headers || {}), "Authorization": `Bearer ${env.ENGINE_TOKEN}`, "Content-Type": "application/json" }
-  });
-}
+
 export default {
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(engine(env, "/internal/collect", { method: "POST" }));
-  },
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/health") return Response.json({ok:true,service:"esports-edge-api"});
-    if (env.PUBLIC_API_ENABLED !== "true") return new Response("API disabled", {status:503});
-    const allowed = ["/api/v1/health", "/api/v1/fixtures", "/api/v1/runs"];
-    if (!allowed.includes(url.pathname)) return new Response("Not found", {status:404});
-    const target = new URL(url.pathname + url.search, env.ENGINE_URL);
-    const upstream = await fetch(target, { headers: { "Accept":"application/json" } });
-    return new Response(upstream.body, { status:upstream.status, headers: {
-      "Content-Type":upstream.headers.get("Content-Type") || "application/json",
-      "Cache-Control":"public, max-age=15"
-    }});
+
+    if (url.pathname === "/health") {
+      return Response.json({
+        ok: true,
+        service: "esports-edge-api",
+        database: "not_checked"
+      });
+    }
+
+    if (url.pathname === "/health/db") {
+      if (!env.DATABASE_URL) {
+        return Response.json({
+          ok: false,
+          error: "DATABASE_URL secret is missing"
+        }, { status: 500 });
+      }
+
+      try {
+        const sql = neon(env.DATABASE_URL);
+
+        const result = await sql`
+          SELECT
+            NOW() AS database_time,
+            current_database() AS database_name
+        `;
+
+        return Response.json({
+          ok: true,
+          service: "esports-edge-api",
+          database: "connected",
+          details: result[0]
+        });
+      } catch (error) {
+        return Response.json({
+          ok: false,
+          database: "connection_failed",
+          error: error instanceof Error
+            ? error.message
+            : "Unknown database error"
+        }, { status: 500 });
+      }
+    }
+
+    return Response.json({
+      service: "Esports Data Engine",
+      status: "online",
+      endpoints: ["/health", "/health/db"]
+    });
   }
 };
