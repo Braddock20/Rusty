@@ -9,13 +9,13 @@ Rusty collects real eSoccer data from eAdriatic/LeagueRepublic, GT Sports League
 
 ## Production architecture
 
-- **Cloudflare Worker** (`cloudflare/`): public read API and five-minute Cron Trigger; owns the active collection path and odds-free shadow prediction API.
+- **Cloudflare Worker** (`cloudflare/`): public read API and authenticated manual collection; owns the active collection path and odds-free shadow prediction API.
 - **Neon PostgreSQL**: canonical persistent store. Raw snapshots, normalized fixtures, score observations, odds observations, provider health, run ownership, pagination checkpoints and forecast audit history are retained.
 - **Rust service** (`rust-engine/`): legacy/experimental implementation. It is not the deployed Worker code and is not covered by the Worker validation results in this release.
 
 ## Reliability policy and limits
 
-No software can guarantee that third-party APIs, Cloudflare or a database will never fail. Rusty is designed to fail safely: it validates upstream responses, respects provider restrictions and rate limits, records source-level failures, uses an atomic database lease with heartbeats, bounds each scheduled run, resumes paginated collection, and refuses to treat ambiguous scores as completed results.
+No software can guarantee that third-party APIs, Cloudflare or a database will never fail. Rusty is designed to fail safely: it validates upstream responses, respects provider restrictions and rate limits, records source-level failures, uses an atomic database lease, bounds each manual run, resumes paginated collection, and refuses to treat ambiguous scores as completed results.
 
 - HTTP 401/403/451 are not retried or bypassed. GT HTTP 451 remains an access restriction.
 - HTTP 429 is not retried immediately. `Retry-After` is persisted as a source cooldown.
@@ -116,7 +116,7 @@ node --experimental-strip-types test/smoke.ts https://your-worker.workers.dev \
 
 `--trigger` additionally runs a real collection and then verifies that the run reached
 a terminal status, that the lease was released and that provider health was recorded.
-Run this once after deploying and once after the first scheduled cron tick.
+Run this once after deploying, then use the authenticated manual collection endpoint when ready.
 
 ### Checking a collection by hand
 
@@ -157,7 +157,7 @@ npx tsc --noEmit
 npx wrangler deploy
 ```
 
-The existing `*/5 * * * *` Cron Trigger is retained. The Worker reads `DATABASE_URL` from its secret. Set `ADMIN_TOKEN` only if you want the authenticated manual endpoint `/api/v1/collection/run`; use `npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
+Automatic Cron collection is disabled in this release. The Worker reads `DATABASE_URL` from its secret. Set `ADMIN_TOKEN` to enable the authenticated manual endpoint `/api/v1/collection/run`; use `npx wrangler secret put ADMIN_TOKEN`. Never expose this token in a browser.
 
 Do not manually trigger a collection until migrations 0006 and 0007 have completed and the Worker deployment has finished. A previously active lease from an older deployment may need to expire before the new collector can acquire it.
 
@@ -180,7 +180,7 @@ Do not manually trigger a collection until migrations 0006 and 0007 have complet
 - Collection runs are bounded, sequential across providers, lease-protected and heartbeat-monitored. Each provider failure is isolated and recorded.
 - Keep raw snapshots and append-only observations. Do not delete historical data as a troubleshooting shortcut.
 - Prediction history is immutable per source/fixture/model; only explicit completed scores settle forecasts. Odds are excluded from prediction features.
-- Cron is a trigger, not a guarantee of exact execution time. Always inspect run status and source health rather than assuming a scheduled trigger succeeded.
+- Collection runs only when the authenticated manual endpoint is invoked. Always inspect run status and source health rather than assuming a request succeeded.
 
 ## First production deployment checklist
 
@@ -190,7 +190,7 @@ Do not manually trigger a collection until migrations 0006 and 0007 have complet
 4. Run `npm test` and `npx tsc --noEmit` from `cloudflare/`.
 5. Deploy the Worker.
 6. Verify `/api/v1/health`, `/api/v1/sources`, and `/api/v1/collection/status`.
-7. Wait for a scheduled run to complete; do not trigger a second run while a lease is active.
+7. Invoke one manual run and wait for it to complete; do not trigger a second run while a lease is active.
 8. Inspect `/api/v1/runs` and provider health; distinguish `success`, `partial`, `failed`, and skipped due to an active lease.
 9. Verify `/api/v1/results` contains only explicitly completed fixtures.
 10. Keep predictions in shadow mode until real chronological backtests and calibration pass.
@@ -205,9 +205,9 @@ cargo run
 
 ## Cloudflare-native collection and operational checks
 
-The Worker collects directly from the three configured providers. It uses a three-minute renewable lease, independent heartbeat, eight-minute run budget, per-fixture ownership checkpoints, and sequential source isolation. A scheduled invocation that cannot acquire the lease exits without starting a duplicate run. Old runs are reconciled only after their heartbeat is stale.
+The Worker collects directly from the three configured providers only through the authenticated manual endpoint. It uses a three-minute lease, an eight-minute run budget, per-fixture ownership checkpoints, and sequential source isolation. A request that cannot acquire the lease exits without starting a duplicate run. Old runs are reconciled only after their heartbeat is stale.
 
-GT and Betika pagination cursors are stored in `collection_checkpoints` and resumed on later Cron runs. A full page at the configured per-run page cap is not reported as a fully completed historical crawl; the cursor advances instead. eAdriatic collection observes a conservative inter-season delay and honors HTTP 429 cooldowns. GT access restrictions are respected without bypass attempts.
+GT and Betika pagination cursors are stored in `collection_checkpoints` and resumed on later manual runs. A full page at the configured per-run page cap is not reported as a fully completed historical crawl; the cursor advances instead. eAdriatic collection observes a conservative inter-season delay and honors HTTP 429 cooldowns. GT access restrictions are respected without bypass attempts.
 
 Operational endpoints:
 - `GET /api/v1/health` — Worker-to-Neon connectivity.
