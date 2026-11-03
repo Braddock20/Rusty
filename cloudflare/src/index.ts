@@ -180,27 +180,46 @@ async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>):Promi
 async function collect(env:Env):Promise<any>{
   const sql=neon(env.DATABASE_URL);
   const ownerToken=crypto.randomUUID();
-  // A ten-minute lease is renewed at collector checkpoints. Ownership tokens prevent
-  // an expired worker from releasing a lock acquired by a newer scheduled run.
+  // Cloudflare scheduled invocations can outlive a short lease. A 20-minute lease,
+  // independent heartbeat, and owner-token checks prevent overlapping collectors.
+  // If the Worker is terminated, the lease eventually expires and a later cron run recovers it.
   const lock=await sql`INSERT INTO collection_lock(lock_name,locked_until,owner_token)
-    VALUES('scheduled',now()+interval '10 minutes',${ownerToken})
+    VALUES('scheduled',now()+interval '20 minutes',${ownerToken})
     ON CONFLICT(lock_name) DO UPDATE SET locked_until=EXCLUDED.locked_until,owner_token=EXCLUDED.owner_token
     WHERE collection_lock.locked_until<now() RETURNING lock_name`;
   if(!lock.length) return {ok:false,skipped:true,reason:"collection already running"};
   let id:number|null=null;
   let lastRenewal=Date.now();
-  const renew=async()=>{
-    if(Date.now()-lastRenewal<30000) return;
-    const updated=await sql`UPDATE collection_lock SET locked_until=now()+interval '10 minutes'
+  let heartbeatStopped=false;
+  let wakeHeartbeat:(()=>void)|null=null;
+  let heartbeatError:unknown=null;
+  const renewLock=async()=>{
+    const updated=await sql`UPDATE collection_lock SET locked_until=now()+interval '20 minutes'
       WHERE lock_name='scheduled' AND owner_token=${ownerToken} RETURNING lock_name`;
     if(!updated.length) throw new Error("COLLECTION_LOCK_LOST: this run no longer owns the scheduled lock");
     lastRenewal=Date.now();
   };
+  const heartbeat=(async()=>{
+    while(!heartbeatStopped){
+      await new Promise<void>(resolve=>{
+        const timer=setTimeout(resolve,30000);
+        wakeHeartbeat=()=>{clearTimeout(timer);resolve();};
+      });
+      wakeHeartbeat=null;
+      if(heartbeatStopped) break;
+      try { await renewLock(); }
+      catch(e) { heartbeatError=e; break; }
+    }
+  })();
+  const renew=async()=>{
+    if(heartbeatError) throw new Error(`COLLECTION_HEARTBEAT_FAILED: ${String(heartbeatError)}`);
+    if(Date.now()-lastRenewal>=30000) await renewLock();
+  };
   try {
-    // Reconcile runs abandoned by an earlier Worker termination; never rewrite a completed run.
+    // Only reconcile old abandoned rows after the lease has expired and this run owns the lock.
     await sql`UPDATE collection_runs SET finished_at=now(),status='failed',
       summary='{"error":"stale run recovered after lock expiry"}'::jsonb
-      WHERE status='running' AND started_at<now()-interval '15 minutes'`;
+      WHERE status='running' AND started_at<now()-interval '25 minutes'`;
     const run=await sql`INSERT INTO collection_runs(status) VALUES('running') RETURNING id`;
     id=Number(run[0].id);
     const results=await Promise.all([
@@ -208,6 +227,7 @@ async function collect(env:Env):Promise<any>{
       collectGt(sql,id,renew),
       collectBetika(sql,id,renew)
     ]);
+    if(heartbeatError) throw new Error(`COLLECTION_HEARTBEAT_FAILED: ${String(heartbeatError)}`);
     const failures=results.filter(x=>!x.ok).length;
     const status=failures===0?"success":failures===results.length?"failed":"partial";
     await sql`UPDATE collection_runs SET finished_at=now(),status=${status},summary=${JSON.stringify(results)}::jsonb WHERE id=${id} AND status='running'`;
@@ -219,7 +239,9 @@ async function collect(env:Env):Promise<any>{
     }
     throw e;
   } finally {
-    // Only the worker that acquired this lease may release it.
+    heartbeatStopped=true;
+    wakeHeartbeat?.();
+    await heartbeat;
     await sql`UPDATE collection_lock SET locked_until=now(),owner_token=NULL
       WHERE lock_name='scheduled' AND owner_token=${ownerToken}`;
   }
@@ -232,7 +254,14 @@ async function route(request:Request,env:Env):Promise<Response>{
   }
   if(path==="/health/db") { try {const r=await sql`SELECT now() AS database_time,current_database() AS database_name`;return json({ok:true,database:"connected",details:r[0]});}catch{return json({ok:false,database:"connection_failed"},503);} }
   if(path==="/api/v1/collection/status"||path==="/api/v1/sources"){
-    const rows=await sql`SELECT * FROM source_health ORDER BY source`; return json({sources:rows});
+    // Return all configured providers, including those never contacted (NULL health fields).
+    const rows=await sql`SELECT expected.source,health.last_success_at,health.last_error_at,
+      health.last_error,COALESCE(health.consecutive_failures,0)::int AS consecutive_failures,
+      health.cooldown_until
+      FROM (VALUES ('eadriatic'),('gt'),('betika')) AS expected(source)
+      LEFT JOIN source_health health ON health.source=expected.source
+      ORDER BY expected.source`;
+    return json({sources:rows});
   }
   if(path==="/api/v1/predictions"||path==="/api/v1/predict"){
     const predictionLimit=Math.min(100,Math.max(1,Number(url.searchParams.get("limit")||30)));
@@ -261,9 +290,24 @@ async function route(request:Request,env:Env):Promise<Response>{
   const offset=Math.max(0,Number(url.searchParams.get("offset")||0));
   const source=url.searchParams.get("source");
   if(path==="/api/v1/fixtures"||path==="/api/v1/results"){
-    const rows=source?await sql`SELECT * FROM fixtures WHERE source=${source} ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`:
-      await sql`SELECT * FROM fixtures ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`;
-    return json({count:rows.length,limit,offset,fixtures:rows});
+    // /fixtures is the full feed. /results is deliberately stricter: a numeric score
+    // alone is not enough; the provider must explicitly mark the event as completed.
+    const completedOnly=path==="/api/v1/results";
+    const rows=source
+      ? completedOnly
+        ? await sql`SELECT * FROM fixtures WHERE source=${source}
+            AND lower(coalesce(status_raw,'')) ~ '(finished|complete|final|played|result)'
+            AND home_score_raw ~ '^[0-9]+(\\.[0-9]+)?$' AND away_score_raw ~ '^[0-9]+(\\.[0-9]+)?$'
+            ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM fixtures WHERE source=${source} ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+      : completedOnly
+        ? await sql`SELECT * FROM fixtures
+            WHERE lower(coalesce(status_raw,'')) ~ '(finished|complete|final|played|result)'
+            AND home_score_raw ~ '^[0-9]+(\\.[0-9]+)?$' AND away_score_raw ~ '^[0-9]+(\\.[0-9]+)?$'
+            ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`
+        : await sql`SELECT * FROM fixtures ORDER BY kickoff_raw DESC NULLS LAST,id DESC LIMIT ${limit} OFFSET ${offset}`;
+    return json({count:rows.length,limit,offset,fixtures:rows,
+      ...(completedOnly?{note:"Only fixtures explicitly marked finished/complete/final/played/result with numeric scores are returned. Providers that do not expose a completion status are intentionally excluded."}:{})});
   }
   const one=path.match(/^\/api\/v1\/fixtures\/([^/]+)$/);
   if(one){const id=decodeURIComponent(one[1]);const rows=await sql`SELECT * FROM fixtures WHERE external_id=${id} ORDER BY id`;return rows.length?json({fixtures:rows}):json({error:"not_found"},404);}
