@@ -1,44 +1,38 @@
-# Deploy Rusty 0.2.0
+# Deploy Rusty 0.2.1
 
-This release adds canonical fixture kickoff timestamps. The migration is additive and preserves all existing rows.
+This is a clean Cloudflare Worker release. It preserves all existing fixtures, raw snapshots, observations and forecasts. It adds a release identifier and safe database/schema diagnostics so the API and scheduled collector can be checked against the same Neon database. Collection now stops before calling providers if the required `fixtures.kickoff_at` column is missing, and reports the exact migration to apply.
 
-## Before deployment
+## 1. Confirm the database schema
 
-1. Take a Neon backup or snapshot.
-2. Confirm the database already has migrations 0001–0006. This release does not ask you to reapply them.
-3. Apply exactly one new migration in the Neon SQL editor or with `psql`:
+The Worker requires migrations 0001–0007. If your database is already on 0007, do not re-run older migrations. For an existing database missing only the canonical kickoff column, apply the additive migration once using the same Neon connection string configured as the Worker's `DATABASE_URL`:
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f rust-engine/migrations/0007_canonical_kickoff.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f cloudflare/migrations/0007_canonical_kickoff.sql
 ```
 
-4. Deploy the contents of `cloudflare/` to the existing Cloudflare Worker. Keep the existing `DATABASE_URL`, cron trigger and secrets. Do not deploy the Rust service as a second collector.
+This migration only adds/backfills `kickoff_at` and indexes; it does not delete or rewrite fixture history. Back up Neon before schema changes.
 
-## After deployment
+## 2. Install and deploy
 
-Check these endpoints when convenient:
-
-- `/api/v1/health` — database connectivity.
-- `/api/v1/collection/status` — lock/run linkage and heartbeat diagnostics. The owner token is no longer exposed.
-- `/api/v1/fixtures/upcoming` — only timezone-aware future fixtures.
-- `/api/v1/results` — only explicitly completed fixtures with valid numeric scores.
-- `/api/v1/predictions?limit=20` — shadow predictions, if sufficient verified data and upcoming fixtures exist.
-
-A `partial` collection can be a valid bounded run when the time budget is reached. Durable provider cursors should continue on later scheduled runs; it must not be represented as a complete provider crawl until its cursor cycle finishes.
-
-## Local validation
-
-From `cloudflare/`:
+From the `cloudflare/` directory, with Node.js 22.6+:
 
 ```bash
 npm ci
 npm test
 npm run typecheck
-npx wrangler deploy --dry-run
+npx wrangler deploy
 ```
 
-For database-backed integration tests, set `DATABASE_URL` to a disposable PostgreSQL database and run `scripts/test-local.sh --db="$DATABASE_URL"`. Never point destructive test setup at production: the integration suite truncates its test tables.
+Keep the existing Worker name, cron trigger and `DATABASE_URL` secret. Do not deploy the Rust service as a second collector. Do not paste database URLs or Cloudflare tokens into chat.
 
-## Important validation boundary
+## 3. Verify the deployed Worker
 
-This package was syntax-checked and its 20 dependency-free unit tests passed in the build workspace. Full integration tests, TypeScript typecheck, Rust compilation, migration execution against PostgreSQL, Cloudflare dry-run and production deployment could not be run here because this workspace did not have a reachable dependency install, PostgreSQL client/server, Cargo toolchain, or production credentials. Do not interpret this artifact as already deployed or production-verified.
+Open `/api/v1/health`. A correct deployment reports `release: "0.2.1"` and a `schema` object with `has_kickoff_at: true`. `/api/v1/collection/status` reports the same release and database/schema diagnostics. These details contain database/schema names and the database role, but never the connection string.
+
+After the next scheduled run, check `/api/v1/sources` and `/api/v1/collection/status`. A successful provider must have a new `last_success_at`. A `partial` run is acceptable only when its source summary clearly identifies which providers completed and which were budget-limited or unavailable. A 429 cooldown must be respected; do not manually hammer the eAdriatic endpoint.
+
+`/api/v1/fixtures/upcoming` can remain empty when there are no verified future fixtures. Predictions intentionally abstain in that case. Historical eAdriatic statuses such as `Normal` or `Normal / Scheduled` are not silently reclassified as completed.
+
+## Local validation boundary
+
+`npm test` runs the 20 dependency-free unit tests. `npm run test:all` includes the database-backed integration suite; use only a disposable PostgreSQL database because the suite truncates its tables. Typecheck and Wrangler dry-run require the dependencies installed by `npm ci`. This workspace could not complete dependency installation due a package-registry timeout, so full typecheck, integration tests, Wrangler dry-run and production deployment remain unverified here.
