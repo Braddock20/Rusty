@@ -64,6 +64,72 @@ production. Upstream provider calls are served deterministic fixtures in
 
 The optional Rust service is not the active production collector. Its collectors and API are not covered by this Worker hardening release; do not run it as a second writer against the production Neon database.
 
+## Testing
+
+There are three layers, all of which run against the real code.
+
+### 1. Unit tests — no external services needed
+
+```bash
+cd cloudflare
+npm install
+npm test          # 19 unit tests; the integration tests skip without DATABASE_URL
+npm run typecheck # tsc --noEmit
+```
+
+### 2. Integration tests — the Worker against a real PostgreSQL database
+
+The Worker talks to `@neondatabase/serverless`, which speaks the Neon HTTP `/sql`
+protocol. `test/helpers/neon-shim.ts` implements that protocol on top of PostgreSQL, so
+the **unmodified** Worker runs against a plain database. Upstream providers are served
+deterministic fixtures that mirror the real payload shapes.
+
+```bash
+for f in rust-engine/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+DATABASE_URL="postgres://user:pass@localhost:5432/rusty" npm test   # 37 tests
+```
+
+### 3. Everything at once — one command
+
+```bash
+scripts/test-local.sh                 # provisions the database, runs the suite,
+                                      # boots the Worker, runs the HTTP smoke test
+scripts/test-local.sh --live          # same, but calls the real upstream APIs
+scripts/test-local.sh --db=postgres://user:pass@localhost:5432/mydb
+```
+
+The script creates the database, applies migrations 0001–0006, runs the test suite,
+starts the Worker on port 8788 (`scripts/local-server.ts`) and runs
+`cloudflare/test/smoke.ts` against it. It exits non-zero if anything fails.
+
+### Smoke-testing a deployed instance
+
+`cloudflare/test/smoke.ts` validates any running Worker over HTTP and checks the
+invariants the fixed defects used to break:
+
+```bash
+cd cloudflare
+node --experimental-strip-types test/smoke.ts https://your-worker.workers.dev
+node --experimental-strip-types test/smoke.ts https://your-worker.workers.dev \
+  --admin-token="$ADMIN_TOKEN" --trigger
+```
+
+`--trigger` additionally runs a real collection and then verifies that the run reached
+a terminal status, that the lease was released and that provider health was recorded.
+Run this once after deploying and once after the first scheduled cron tick.
+
+### Checking a collection by hand
+
+```bash
+curl -s https://your-worker.workers.dev/api/v1/collection/status | jq
+curl -s https://your-worker.workers.dev/api/v1/runs?limit=3 | jq '.runs[] | {id,status,finished_at}'
+curl -s https://your-worker.workers.dev/api/v1/sources | jq '.sources[] | {source,last_attempt_at,last_record_count,error_code}'
+```
+
+A healthy collection shows `status` of `success` or `partial`, a populated
+`finished_at`, a released lock (`owner_token: null`) and all three providers with a
+recent `last_attempt_at`.
+
 ## Configuration
 
 | Variable | Purpose |
