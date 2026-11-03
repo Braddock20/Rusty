@@ -1,4 +1,4 @@
-name = "esports-edge-api"
+name = "rusty"
 main = "src/index.ts"
 compatibility_date = "2026-11-03"
 
