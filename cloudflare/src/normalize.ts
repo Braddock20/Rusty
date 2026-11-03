@@ -31,3 +31,20 @@ export function isSoccerCompetition(fixture:JsonObject):boolean {
   return /e.?soccer/i.test(String(label ?? fixture.season?.tournament?.category?.name ?? ""));
 }
 export function validOdds(value:number):boolean { return Number.isFinite(value) && value > 1; }
+
+/** Extract only explicit GT player/team identifiers; never infer identity from display names. */
+export function gtPlayerParticipants(fixture:JsonObject) {
+  return asArray(fixture.participants).flatMap((entry:any)=>{
+    const participant=entry?.participant??{};
+    const player=participant?.player;
+    if(!player || typeof player!=="object") return [];
+    const playerId=asText(player.id ?? player.player_id ?? player.playerId);
+    if(!playerId) return [];
+    const team=participant?.team ?? {};
+    const teamId=asText(team.id ?? team.team_id ?? team.teamId);
+    const side=String(entry?.side??"").toLowerCase();
+    return [{playerId,playerName:asText(player.nickname ?? player.name),teamId,teamName:asText(team.name ?? team.nickname),side,
+      isStarter:typeof (entry?.is_starter ?? entry?.isStarting ?? player?.is_starter)==="boolean" ? (entry?.is_starter ?? entry?.isStarting ?? player?.is_starter) : null,
+      position:asText(entry?.position ?? player?.position),payload:entry}];
+  });
+}
