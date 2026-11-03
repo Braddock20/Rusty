@@ -1,5 +1,5 @@
-import { gtPlayerParticipants } from "./normalize";
-import { parseTimestamp, validScore } from "./guards";
+import { gtPlayerParticipants } from "./normalize.ts";
+import { parseTimestamp, validScore } from "./guards.ts";
 /** Odds-free, source-scoped shadow forecasting. Never infers team identity from names. */
 type Row = Record<string, any>;
 const MODEL_VERSION = "rusty-shadow-v2";
@@ -65,7 +65,10 @@ export async function buildPredictions(sql:any, limit=50, source:string|null=nul
         const expected=1/(1+Math.pow(10,((ar-hr)-35)/400));
         const actual=hs>as?1:hs<as?0:0.5;
         const margin=Math.min(2.2,Math.log1p(Math.abs(hs-as))),k=24*(0.65+0.35*w)*Math.max(0.7,margin);
-        ratings.set(ht,hr+k*(actual-expected));ratings.set(at,ar-k*((1-actual)-(1-expected)));
+        ratings.set(ht,hr+k*(actual-expected));
+        // The away rating must move against the home rating. The previous sign made
+        // both teams gain Elo points when the home team won.
+        ratings.set(at,ar+k*((1-actual)-(1-expected)));
         const a=get(ht),b=get(at);a.gf+=hs*w;a.ga+=as*w;a.n+=w;b.gf+=as*w;b.ga+=hs*w;b.n+=w;
       }
       leagueHome+=hs*w;leagueAway+=as*w;leagueN+=w;
