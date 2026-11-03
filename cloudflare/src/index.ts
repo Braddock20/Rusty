@@ -248,7 +248,7 @@ async function route(request:Request,env:Env):Promise<Response>{
     const rows=await sql`SELECT model_version,count(*)::int AS settled,
       count(*) FILTER (WHERE predicted_outcome=actual_outcome)::int AS correct,
       round(100.0*count(*) FILTER (WHERE predicted_outcome=actual_outcome)/NULLIF(count(*),0),2) AS accuracy_percent,
-      round(avg((home_probability-CASE WHEN actual_outcome='HOME' THEN 1 ELSE 0 END)^2 + (draw_probability-CASE WHEN actual_outcome='DRAW' THEN 1 ELSE 0 END)^2 + (away_probability-CASE WHEN actual_outcome='AWAY' THEN 1 ELSE 0 END)^2),5) AS brier_score,
+      round((avg((home_probability-CASE WHEN actual_outcome='HOME' THEN 1 ELSE 0 END)^2 + (draw_probability-CASE WHEN actual_outcome='DRAW' THEN 1 ELSE 0 END)^2 + (away_probability-CASE WHEN actual_outcome='AWAY' THEN 1 ELSE 0 END)^2))::numeric,5) AS brier_score,
       min(predicted_at) AS first_prediction,max(settled_at) AS latest_settlement
       FROM (SELECT DISTINCT ON(source,external_fixture_id,model_version) * FROM prediction_history WHERE settled_at IS NOT NULL ORDER BY source,external_fixture_id,model_version,predicted_at DESC) scored GROUP BY model_version ORDER BY model_version`;
     return json({performance:rows,note:"Accuracy is calculated only on settled, previously recorded forecasts. Probabilities are evaluated with the multiclass Brier score; no future result is used to create a past forecast."});
