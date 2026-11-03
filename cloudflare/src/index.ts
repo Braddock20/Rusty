@@ -33,6 +33,7 @@ const betikaKickoff = (value: unknown, offsetMinutes: number): string | null => 
   }
   return raw;
 };
+const RELEASE_VERSION = "0.2.1";
 const MAX_RUN_MS = 8 * 60 * 1000;
 const HEARTBEAT_MS = 30000;
 
@@ -285,8 +286,22 @@ async function collectBetika(sql:any,runId:number,renew:()=>Promise<void>,offset
     return count;
   },renew);
 }
+async function databaseDiagnostics(sql:any){
+  const rows=await sql`SELECT current_database() AS database_name,
+    current_schema() AS schema_name, current_user AS database_user,
+    to_regclass('fixtures')::text AS fixtures_relation,
+    EXISTS(SELECT 1 FROM information_schema.columns
+      WHERE table_schema = ANY(current_schemas(false))
+        AND table_name='fixtures' AND column_name='kickoff_at') AS has_kickoff_at`;
+  return rows[0] ?? {};
+}
+
 async function collect(env:Env):Promise<any>{
   const sql=neon(env.DATABASE_URL);
+  const dbInfo=await databaseDiagnostics(sql);
+  if(!dbInfo.has_kickoff_at){
+    throw new Error(`DATABASE_SCHEMA_MISMATCH: fixtures.kickoff_at is missing in ${dbInfo.database_name ?? "unknown database"}/${dbInfo.schema_name ?? "unknown schema"}; apply rust-engine/migrations/0007_canonical_kickoff.sql to the Worker's DATABASE_URL before collection`);
+  }
   const ownerToken=crypto.randomUUID();
   // Acquire the lease AND create the linked run in one transaction.
   // A single statement cannot express this: a data-modifying CTE's write is not
@@ -382,10 +397,10 @@ async function collect(env:Env):Promise<any>{
 async function route(request:Request,env:Env):Promise<Response>{
   const url=new URL(request.url), path=url.pathname, sql=neon(env.DATABASE_URL);
   if(path==="/health"||path==="/api/v1/health") {
-    try { const r=await sql`SELECT now() AS database_time`; return json({ok:true,service:"rusty-esoccer",database:"connected",database_time:r[0].database_time});}
+    try { const r=await sql`SELECT now() AS database_time`; const db=await databaseDiagnostics(sql); return json({ok:true,service:"rusty-esoccer",release:RELEASE_VERSION,database:"connected",database_time:r[0].database_time,schema:db});}
     catch(e){return json({ok:false,error:"database unavailable"},503);}
   }
-  if(path==="/health/db") { try {const r=await sql`SELECT now() AS database_time,current_database() AS database_name`;return json({ok:true,database:"connected",details:r[0]});}catch{return json({ok:false,database:"connection_failed"},503);} }
+  if(path==="/health/db") { try {const r=await sql`SELECT now() AS database_time`;const db=await databaseDiagnostics(sql);return json({ok:true,release:RELEASE_VERSION,database:"connected",details:{...r[0],...db}});}catch{return json({ok:false,database:"connection_failed"},503);} }
   if(path==="/api/v1/sources"){
     // Return all configured providers, including those never contacted (NULL health fields).
     const rows=await sql`SELECT expected.source,health.last_success_at,health.last_error_at,
@@ -407,7 +422,8 @@ async function route(request:Request,env:Env):Promise<Response>{
     const runningRows=await sql`SELECT count(*)::int AS count FROM collection_runs WHERE status='running'`;
     const linkedRows=lock?.run_id==null?[]:await sql`SELECT id,status,heartbeat_at,started_at FROM collection_runs WHERE id=${lock.run_id} LIMIT 1`;
     const linkedRun=linkedRows[0]??null;
-    return json({lock,recent_runs:recentRuns,checkpoints,diagnostics:{running_runs_count:Number(runningRows[0]?.count??0),active_lock_has_run_link:lock?.is_locked?Boolean(linkedRun):null,linked_run_status:linkedRun?.status??null,linked_run_heartbeat_at:linkedRun?.heartbeat_at??null,warning:lock?.is_locked&&lock.run_id==null?"Active lease has no linked collection run; inspect deployed Worker version and lease owner before manual collection.":null}});
+    const db=await databaseDiagnostics(sql);
+    return json({release:RELEASE_VERSION,lock,recent_runs:recentRuns,checkpoints,diagnostics:{running_runs_count:Number(runningRows[0]?.count??0),active_lock_has_run_link:lock?.is_locked?Boolean(linkedRun):null,linked_run_status:linkedRun?.status??null,linked_run_heartbeat_at:linkedRun?.heartbeat_at??null,database:db,warning:lock?.is_locked&&lock.run_id==null?"Active lease has no linked collection run; inspect deployed Worker version and lease owner before manual collection.":null}});
   }
   if(path==="/api/v1/predictions"||path==="/api/v1/predict"){
     const predictionLimit=safeInt(url.searchParams.get("limit"),30,1,100);
