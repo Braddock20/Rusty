@@ -57,7 +57,13 @@ async function sourceRun(sql:any, runId:number, source:string, fn:()=>Promise<nu
 }
 async function collectEal(sql:any, runId:number):Promise<SourceResult> {
   return sourceRun(sql,runId,"eadriatic",async()=>{
-    const seasons=(await sql`SELECT external_id FROM entity_mappings WHERE entity_type='eal_season' AND source_a='eadriatic' AND verified=true`).map((x:any)=>String(x.external_id));
+    const seasons=(await sql`
+  SELECT external_id_a AS external_id
+  FROM entity_mappings
+  WHERE entity_type='eal_season'
+    AND source_a='eadriatic'
+    AND verified=true
+`).map((x:any)=>String(x.external_id));
     const ids=[...new Set(["656829288",...seasons])]; let count=0;
     for (const season of ids) {
       const v=await getJson(`https://api.leaguerepublic.com/json/getMatchHub/${encodeURIComponent(season)}.json`);
