@@ -175,3 +175,32 @@ and detailed fixture APIs have not yet been wired. The player and head-to-head A
 routes explicitly avoid pretending that fixture participant names are verified player
 identities. Betika history is only available from the snapshots collected after deployment;
 the current matches endpoint is not treated as a historical-results API.
+
+## Odds-free prediction engine (experimental shadow mode)
+
+Apply `rust-engine/migrations/0003_prediction_engine.sql` after migrations 0001 and 0002. The Worker exposes:
+
+- `GET /api/v1/predictions?limit=30` — upcoming fixtures with experimental, odds-free model forecasts; optionally filter with `&source=betika`, `eadriatic`, or `gt`.
+- `GET /api/v1/predict` — alias for the same endpoint.
+- `GET /api/v1/predictions/performance` — settled walk-forward forecast record (accuracy and multiclass Brier score).
+
+The first experimental ensemble combines a recency-weighted Elo rating with a score-distribution model using historical goals for/against and shrinkage toward competition averages. It reads fixture results only; it never queries or uses `odds_observations`. A forecast is withheld when the exact source/competition history has fewer than 12 matches for the two participants. The current version is deliberately marked `SHADOW_ONLY_UNVALIDATED` or `PASS_*`; do not use it as a betting recommendation. Its probability outputs are model estimates, not accuracy percentages. `evidence_strength_score` measures sample support, not chance of winning.
+
+Before promoting a model to actionable status, build and pass chronological walk-forward tests on the actual eAdriatic and GT datasets, compare against simple baselines, report accuracy plus log loss/Brier score and calibration by probability bucket, and retain a truly untouched final test period. The present production sources do not yet provide reliable eAdriatic/GT histories (eAdriatic previously returned a schema error; GT returned HTTP 451), so this patch must not claim a validated 99.999% success rate. Betika may supply fixture names/scores for its competitions, but its odds are excluded from every prediction feature.
+
+## Rusty intelligence foundation (migration 0004)
+
+Apply `rust-engine/migrations/0004_intelligence_foundation.sql` after migrations 0001-0003. It is additive and preserves existing production rows. It creates source-scoped player/team participation history, player-team relationship history, model registry, backtest records, and prediction feature snapshots.
+
+New endpoints:
+- `GET /api/v1/intelligence/status` — data coverage and model registry status.
+- `GET /api/v1/players` — only source-identified players observed in GT participant payloads.
+- `GET /api/v1/players/:source_player_id?source=gt` — observed appearances, confirmed starts, unknown start status, and team associations.
+
+GT collection now records player/team relationships only when the upstream fixture explicitly provides player IDs and team IDs. Starter status and position are nullable and remain unknown unless the source explicitly supplies them. Names are never used to merge identities across sources. The prediction response now includes last-ten form, head-to-head summary, and player/team pairing evidence where verified IDs and history exist. These player/team observations are currently explanatory evidence, not a model weight; they must pass independent walk-forward ablation tests before they influence forecast probabilities.
+
+Predictions remain odds-free and shadow-only. `probabilities` are model estimates, not accuracy percentages. `evidence_strength_score` is not a probability. The system must not promote a model based on hit rate alone: promotion requires adequate sample size, improvement over simple baselines on chronological holdouts, acceptable Brier score/log loss, calibration checks, and stable performance across source/competition/time segments. No 99.999% accuracy is promised.
+
+### Required next data capabilities
+
+The existing upstream feeds do not yet guarantee complete player lineups, confirmed starters, per-player in-game actions, controller/formation settings, or match-state telemetry. The new schema preserves explicit participant data when present, but does not fabricate missing fields. Those signals can only become model inputs after a lawful, stable source supplies them and their timestamps prove they were known before kickoff. GT HTTP 451 and LeagueRepublic 429 must continue to be respected; do not bypass access controls or rate limits.
