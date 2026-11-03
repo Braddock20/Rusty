@@ -79,6 +79,12 @@ export function isRetryableStatus(status: number): boolean {
 /** ISO timestamps and epoch seconds/milliseconds only; ambiguous local clock strings are rejected. */
 export function parseTimestamp(value: unknown): number | null {
   if (value === null || value === undefined || value === "") return null;
+  if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (Number.isInteger(value) && value >= 1_000_000_000 && value < 100_000_000_000) return value * 1000;
+    if (Number.isInteger(value) && value >= 100_000_000_000 && value <= 9_999_999_999_999) return value;
+    return null;
+  }
   const s = String(value).trim();
   if (/^\d{10,13}$/.test(s)) {
     const raw = Number(s);
