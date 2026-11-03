@@ -1,11 +1,11 @@
-
 {
   "name": "esports-edge-api",
   "version": "0.1.0",
   "private": true,
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2"
@@ -14,5 +14,9 @@
     "@cloudflare/workers-types": "^4.20250124.0",
     "typescript": "^5.7.3",
     "wrangler": "^3.100.0"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
   }
 }
