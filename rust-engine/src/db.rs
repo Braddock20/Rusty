@@ -14,6 +14,7 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         include_str!("../migrations/0004_intelligence_foundation.sql"),
         include_str!("../migrations/0005_collection_reliability.sql"),
         include_str!("../migrations/0006_production_hardening.sql"),
+        include_str!("../migrations/0007_canonical_kickoff.sql"),
     ] {
         sqlx::raw_sql(statement).execute(pool).await?;
     }
@@ -36,9 +37,13 @@ pub async fn save_raw(pool: &PgPool, run_id: i64, source: &str, dataset: &str, e
     Ok(())
 }
 pub async fn save_fixture(pool: &PgPool, source: &str, id: &str, competition: Option<&str>, home: Option<&str>, away: Option<&str>, kickoff: Option<&str>, status: Option<&str>, hs: Option<&str>, as_: Option<&str>, home_team_id: Option<&str>, away_team_id: Option<&str>, payload: &Value) -> anyhow::Result<()> {
-    sqlx::query(r#"INSERT INTO fixtures(source,external_id,competition,home_name,away_name,kickoff_raw,status_raw,home_score_raw,away_score_raw,payload,home_team_external_id,away_team_external_id,updated_at)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
-      ON CONFLICT(source,external_id) DO UPDATE SET competition=EXCLUDED.competition,home_name=EXCLUDED.home_name,away_name=EXCLUDED.away_name,kickoff_raw=EXCLUDED.kickoff_raw,status_raw=EXCLUDED.status_raw,home_score_raw=EXCLUDED.home_score_raw,away_score_raw=EXCLUDED.away_score_raw,payload=EXCLUDED.payload,home_team_external_id=COALESCE(EXCLUDED.home_team_external_id,fixtures.home_team_external_id),away_team_external_id=COALESCE(EXCLUDED.away_team_external_id,fixtures.away_team_external_id),updated_at=now()"#)
+    sqlx::query(r#"INSERT INTO fixtures(source,external_id,competition,home_name,away_name,kickoff_raw,kickoff_at,status_raw,home_score_raw,away_score_raw,payload,home_team_external_id,away_team_external_id,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,CASE
+        WHEN $6 ~ '^[0-9]{13}$' THEN to_timestamp($6::numeric / 1000)
+        WHEN $6 ~ '^[0-9]{10}$' THEN to_timestamp($6::numeric)
+        WHEN $6 ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*(Z|[+-][0-9]{2}:?[0-9]{2})$' THEN $6::timestamptz
+        ELSE NULL END,$7,$8,$9,$10,$11,$12,now())
+      ON CONFLICT(source,external_id) DO UPDATE SET competition=EXCLUDED.competition,home_name=EXCLUDED.home_name,away_name=EXCLUDED.away_name,kickoff_raw=EXCLUDED.kickoff_raw,kickoff_at=COALESCE(EXCLUDED.kickoff_at,fixtures.kickoff_at),status_raw=EXCLUDED.status_raw,home_score_raw=EXCLUDED.home_score_raw,away_score_raw=EXCLUDED.away_score_raw,payload=EXCLUDED.payload,home_team_external_id=COALESCE(EXCLUDED.home_team_external_id,fixtures.home_team_external_id),away_team_external_id=COALESCE(EXCLUDED.away_team_external_id,fixtures.away_team_external_id),updated_at=now()"#)
       .bind(source).bind(id).bind(competition).bind(home).bind(away).bind(kickoff).bind(status).bind(hs).bind(as_)
       .bind(payload).bind(home_team_id).bind(away_team_id)
       .execute(pool).await?;
