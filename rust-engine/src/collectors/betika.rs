@@ -21,13 +21,13 @@ pub async fn collect(s: &AppState, run_id: i64) -> Outcome {
                 db::save_fixture(&s.pool,"betika",&id,
                     normalize::text(row,&["competition_name","category"]).as_deref(),
                     normalize::text(row,&["home_team"]).as_deref(),normalize::text(row,&["away_team"]).as_deref(),
-                    normalize::text(row,&["start_time"]).as_deref(),None,hs.as_deref(),as_.as_deref(),row).await?;
+                    normalize::text(row,&["start_time"]).as_deref(),None,hs.as_deref(),as_.as_deref(),None,None,row).await?;
                 if let Some(odds)=row.get("odds").and_then(Value::as_array) {
                     for odd in odds {
                         let mut item=odd.clone();
                         if let Some(obj)=item.as_object_mut() {
                             obj.insert("market".into(),Value::String(normalize::text(odd,&["name","sub_type_name","sub_type_id"]).unwrap_or_else(||"unknown".into())));
-                            obj.insert("selection".into(),Value::String(normalize::text(odd,&["display","odd_key"]).unwrap_or_else(||"unknown".into())));
+                            obj.insert("selection".into(),Value::String(normalize::text(odd,&["odd_key","display"]).unwrap_or_else(||"unknown".into())));
                         }
                         db::save_odds(&s.pool,&id,&item).await?;
                     }
