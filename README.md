@@ -2,6 +2,11 @@
 
 Rusty collects real eSoccer data from eAdriatic/LeagueRepublic, GT Sports League and Betika into Neon PostgreSQL. The currently active production path is the **Cloudflare Worker native collector** in `cloudflare/`, with Neon as the canonical store. The Rust service in `rust-engine/` is retained as an optional legacy/experimental service; do not run its collector in parallel with the Worker until it has separately passed the same reliability and data-integrity checks.
 
+> **See `FIX-REPORT.md`** for the defects that were reproduced and fixed in this pass,
+> including the lease bug that prevented collection from running at all, the query-limit
+> bug that made every list endpoint return a single row, and the GT/eAdriatic payload
+> mismatches that stopped both upstream sources from being ingested.
+
 ## Production architecture
 
 - **Cloudflare Worker** (`cloudflare/`): public read API and five-minute Cron Trigger; owns the active collection path and odds-free shadow prediction API.
@@ -41,7 +46,31 @@ npx wrangler dev
 
 Configure the `DATABASE_URL` secret/binding in the local Wrangler environment. Do not commit credentials or `.dev.vars` files.
 
+The unit tests run without any external service. The integration tests in
+`test/worker.integration.test.ts` execute the **unmodified Worker** against a real
+PostgreSQL database and are skipped unless `DATABASE_URL` is set:
+
+```bash
+# create the database, then apply the migrations
+for f in rust-engine/migrations/000*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+
+DATABASE_URL="postgres://user:pass@localhost:5432/rusty" npm test
+```
+
+`test/helpers/neon-shim.ts` implements the Neon HTTP `/sql` protocol on top of
+PostgreSQL, so the Worker talks to the database through the same driver it uses in
+production. Upstream provider calls are served deterministic fixtures in
+`test/helpers/provider-fixtures.ts`, which mirror the real payload shapes.
+
 The optional Rust service is not the active production collector. Its collectors and API are not covered by this Worker hardening release; do not run it as a second writer against the production Neon database.
+
+## Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Neon/PostgreSQL connection string (required) |
+| `ADMIN_TOKEN` | Bearer token for the manual `POST /api/v1/collection/run` endpoint (optional) |
+| `BETIKA_UTC_OFFSET_MINUTES` | Offset of the Betika provider clock, e.g. `180` for UTC+3. Betika publishes `start_time` as a timezone-less local string; without this setting the value is stored but never used as a forecast candidate, because an ambiguous local time is never guessed. |
 
 ## Deploy Cloudflare Worker
 
